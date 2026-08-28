@@ -46,7 +46,7 @@ NetworkAttachmentDefinition (NAD) in the `default` namespace:
 
 | Subnet | NAD | Whereabouts pool | Gateway |
 |--------|-----|------------------|---------|
-| 10.66.2.0/24 | `vm-underlay-10-66-2-0` | 10.66.2.130 ~ 139 | 10.66.2.254 |
+| 10.66.2.0/24 | `vm-underlay-10-66-2-0` | 10.66.2.200 ~ 220 | 10.66.2.254 |
 | 10.66.3.0/24 | `vm-underlay-10-66-3-0` | 10.66.3.200 ~ 220 | 10.66.3.254 |
 
 Nodes are labeled by subnet: `kubevirt.io/subnet=10-66-2-0` / `10-66-3-0`.
@@ -177,7 +177,7 @@ spec:
                 match: { name: "en*" }
                 dhcp4: true
                 nameservers:
-                  addresses: [223.5.5.5, 114.114.114.114]
+                  addresses: [223.5.5.5, 8.8.8.8]
 ```
 
 Create and confirm:
