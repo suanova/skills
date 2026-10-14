@@ -1,18 +1,5 @@
-# Template for the Harbor read-only robot credential — the file preflight takes
-# via --harbor-ro-values at Step 0, conventionally saved as
-# ~/.cubestack/private/harbor-ro.conf (mode 600, authored with the Write tool).
-#
-# PLACEHOLDERS ONLY. This file is a template; a real one holds a live token.
-#
-# Exactly these two keys — the lint refuses any other key in the file, because
-# Step 7 sources it inside the pod. Single quotes, no embedded quote.
-#
-# Scope: one robot account with PULL on suanova-private (the operator chart,
-# private) and suanova (component images; anonymous-readable, so this is cheap
-# insurance). On a 2FA account the password is the CLI SECRET from the Harbor
-# user profile, not the login password.
-#
-# Required unless Step 0 is also given --no-operator.
+# harbor-ro.conf — the Harbor read-only robot credential, passed to preflight
+# via --harbor-ro-values. Placeholders only.
 
 HARBOR_RO_USER='robot$<robot-name>'
 HARBOR_RO_PW='<robot-token-or-cli-secret>'
