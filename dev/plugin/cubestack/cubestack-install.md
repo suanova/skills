@@ -275,6 +275,7 @@ HARBOR_RO_PW='<the robot token>'
 
 Same format as the values file (`KEY='value'`, single quotes, no embedded quote), and the
 same two-key lint at Step 0 — a key outside that pair is refused before anything runs.
+A template is in `examples/harbor-ro.conf.example`.
 
 **Why a separate file rather than two more keys in the values file.** The values file is
 `sourced` with `set -a` inside the pod by `configure` and `fetch-offline`, which is what
@@ -741,6 +742,27 @@ Everything else the import needs is already inside the env file: the monitors, t
 the CSI secrets, the pool and file-system names, the RGW endpoint. So when you pass
 `--external-ceph-env`, **`CEPH_MONITORS`, `CEPH_KEYRING` and the `CEPHFS_*` keys are not
 needed** — the rewriter does not ask for them on that path.
+
+⚠ **The lint checks four keys; the import needs more.** `preflight` lints only the four
+`ROOK_EXTERNAL_*` keys, but the official import path also consumes `CEPHX_KEY_GENERATION` and
+the `CSI_*_SECRET` / `CSI_*_SECRET_NAME` pairs — **with no defaults**, because an external
+Ceph is not managed by this box, so those CephX users cannot be created here and must arrive
+in this file. A file holding only the linted four passes Step 0 and then dies mid-deploy:
+
+```
+03_ceph_csi.sh: line 442: CSI_RBD_PROVISIONER_SECRET_NAME: unbound variable
+```
+
+Two more failure modes worth recognising, both seen on real runs: a `ROOK_EXTERNAL_CEPH_MON_DATA`
+written as a bare `ip:port` (no `mon-name=` prefix) parses to **zero** monitors, and the
+CephCluster then never leaves `Progressing`
+(`spec.monitors: Invalid value: 0: ... should have at least 1 items`); and a re-run of
+`ceph_csi` on a box that already carries an external CephCluster takes the *in-cluster* branch
+and waits 10 minutes for a CR named `rook-ceph` that does not exist — delete the leftover CR
+before re-running.
+
+Take the Provider's **full** export. `examples/external-ceph.env.example` lists every key it
+must contain, with placeholder values.
 
 Three things worth knowing before you run it:
 
