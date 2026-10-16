@@ -1,0 +1,5 @@
+# harbor-ro.conf — the Harbor read-only robot credential, passed to preflight
+# via --harbor-ro-values. Placeholders only.
+
+HARBOR_RO_USER='robot$<robot-name>'
+HARBOR_RO_PW='<robot-token-or-cli-secret>'
