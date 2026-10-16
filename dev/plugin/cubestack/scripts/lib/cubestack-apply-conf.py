@@ -67,8 +67,26 @@ def fail(code, message):
 
 
 def quote(value):
-    """Render a value as a safe double-quoted shell assignment."""
-    return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
+    """Render a value as a safe double-quoted shell assignment.
+
+    cluster.conf is SOURCED, not parsed, and this renders into double quotes — so
+    a `$`, a backtick or a `\\` in a value is a shell expansion rather than data
+    unless every one of them is escaped. That is not hypothetical: the Harbor
+    robot accounts this skill uses are named `robot$<project>+<name>`, and
+    unescaped they render as `"robot$cubestack+installer"`, which the installer's
+    `source` expands to `robot+installer` — a wrong credential in a
+    docker-registry Secret, a 401 on every node's pull, and an operator that
+    ImagePullBackOffs while the module that created the Secret reports success.
+    A password containing `$` fails the same way, wherever it is used.
+    Escaping can only turn a mangled value back into the literal the caller
+    passed: nothing here is ever meant to be expanded.
+    """
+    return '"%s"' % (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
+    )
 
 
 def make_subst(state):
@@ -88,13 +106,43 @@ def make_subst(state):
                 s,
                 flags=re.M,
             )
-        elif append:
-            # The key exists ONLY inside the example's *commented* block (every
-            # CEPHFS_* field is like this -- the example's live section has no
-            # CEPHFS_FS= line). Append at EOF so the assignment still wins:
-            # cluster.conf is bash-sourced top-down, last assignment wins.
+        elif append or key in state["advanced"]:
+            # Two ways to land here, and both mean the assignment is still LIVE
+            # -- which is the only thing that makes appending honest:
+            #
+            #  * append=True -- the key exists ONLY inside the example's
+            #    *commented* block (every CEPHFS_* field is like this; the
+            #    example's live section has no CEPHFS_FS= line).
+            #  * the key is declared in cluster.defaults.conf instead. The
+            #    2026-10-15 config split moved it there, and check-modules.sh
+            #    now ENFORCES that the two layers declare disjoint variable sets
+            #    (its check 7, "配置双层无同名声明"), so a relocated key is absent
+            #    from the example BY DESIGN rather than gone. load_config loads
+            #    the defaults layer unconditionally, and it declares these as
+            #    ${KEY:-...}, so the appended literal wins whether that layer is
+            #    sourced before or after this file.
+            #
+            # Either way append at EOF: cluster.conf is bash-sourced top-down
+            # and the last assignment wins.
             state["text"] = s.rstrip("\n") + "\n%s=%s\n" % (key, quote(value))
         else:
+            # Absent from BOTH layers -- this installer does not know the key.
+            # That MUST stay loud, and it is the whole reason this branch is not
+            # folded into the append above: it is what catches config written for
+            # a module the installer has since removed. LWS_ENABLED is the live
+            # example -- the 2026-10-15 branch deleted 07_gpu_lws.sh and
+            # 24_verify_lws.sh and dropped the key from both layers, so supplying
+            # it now stops the run here.
+            #
+            # This branch is the SECOND line of defence, not the first. A key the
+            # values file should not carry at all (ENVOY_GATEWAY_ENABLED /
+            # ENVOY_AI_GATEWAY_ENABLED / PROMETHEUS_ENABLED, whose modules
+            # dc4f3d7 removed) is refused by the values lint in scripts/lib/
+            # common.sh before this file is ever spawned, so subst() is never
+            # called with it and this branch never sees it. The failure it does
+            # catch is the one the lint cannot: a key that is still allow-listed
+            # and was therefore still live when that list was last checked, but
+            # has since gone from both layers.
             fail(EXIT_FIELD_MISSING, "field %s not found" % key)
 
     return subst
@@ -111,7 +159,27 @@ def main():
     except OSError as exc:
         fail(1, "cannot read %s: %s" % (conf_path, exc))
 
-    state = {"text": text}
+    # Read the names the SECOND config layer declares. The 2026-10-15 split put
+    # cluster.defaults.conf beside this file, load_config sources it
+    # unconditionally, and check-modules.sh enforces that the two layers declare
+    # DISJOINT key sets -- so a key absent from the example is ambiguous on its
+    # own, and this set is what resolves it into "relocated" (append) or "gone"
+    # (fail loudly). Absence of the file is not an error: images from before the
+    # split have no second layer, and an empty set reproduces the old behaviour
+    # exactly.
+    advanced = set()
+    defaults_path = os.path.join(
+        os.path.dirname(os.path.abspath(conf_path)), "cluster.defaults.conf"
+    )
+    try:
+        with open(defaults_path) as fh:
+            advanced = set(
+                re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)=", fh.read(), flags=re.M)
+            )
+    except OSError:
+        pass
+
+    state = {"text": text, "advanced": advanced}
     subst = make_subst(state)
     applied = []
 
@@ -121,9 +189,6 @@ def main():
     # --- credentials --------------------------------------------------------
     basic = {
         "SSH_DEFAULT_PASSWORD": env("SSH_PW"),
-        "MINIO_ENDPOINT": env("MINIO_EP"),
-        "MINIO_ACCESS_KEY": env("MINIO_AK"),
-        "MINIO_SECRET_KEY": env("MINIO_SK"),
     }
     for key, value in basic.items():
         if not value:
@@ -131,6 +196,35 @@ def main():
             # credential that only surfaces as an auth failure mid-deploy.
             fail(EXIT_MISSING_KEYS, "%s is empty" % key)
         subst(key, value)
+        applied.append(key)
+
+    # --- MinIO creds --------------------------------------------------------
+    # APPENDED, not demanded, and the reason is the image, not a preference.
+    # The 2026-10-15 installer build moved these three out of cluster.conf.example
+    # entirely -- they now appear only in cluster.defaults.conf, as
+    # `MINIO_ENDPOINT="${MINIO_ENDPOINT:-}"` and friends. `subst()` with
+    # append=False hard-fails "field MINIO_ENDPOINT not found" on such an image,
+    # which is how cubestack4 died at Step 4 with E_CONF_FIELD_MISSING. The
+    # CEPHFS_* keys below get the same treatment for the identical reason (they
+    # survive only inside the example's commented block).
+    #
+    # Appending is order-safe against cluster.defaults.conf: `:-` substitutes only
+    # when unset OR empty, so the literal written here survives whether defaults
+    # are sourced before this file (empty -> literal) or after it (set -> kept).
+    #
+    # Nothing in the deploy path reads these -- the offline fetch reads
+    # config/minio.conf, which `fetch-offline` seeds through cubestack-minio-conf.py.
+    # They are written anyway so a run on the older image, and any tool that
+    # sources cluster.conf for MinIO, keeps working unchanged.
+    minio = {
+        "MINIO_ENDPOINT": env("MINIO_EP"),
+        "MINIO_ACCESS_KEY": env("MINIO_AK"),
+        "MINIO_SECRET_KEY": env("MINIO_SK"),
+    }
+    for key, value in minio.items():
+        if not value:
+            fail(EXIT_MISSING_KEYS, "%s is empty" % key)
+        subst(key, value, append=True)
         applied.append(key)
 
     # --- NODES --------------------------------------------------------------
@@ -276,6 +370,58 @@ def main():
     ):
         if env(key):
             subst(key, env(key))
+            applied.append(key)
+
+    # --- operator image source ----------------------------------------------
+    # ONLINE_DEPLOY_CUBESTACK_OPERATOR chooses WHERE the cubeStack operator's
+    # images come from — never whether an operator is installed. That is
+    # CUBESTACK_OPERATOR_ENABLED, ON by default, and it is why a deploy nowadays
+    # hands Step 7 a CR to adopt. `true` = each node pulls them straight from
+    # Harbor, the chart's own configuration; `false` = the offline tar is pushed
+    # into the in-cluster registry and the nodes pull from there.
+    #
+    # Written ALWAYS when the run states a mode, `false` included, for the same
+    # reason REGISTRY_ENABLED above is pinned explicitly: the key is declared in
+    # cluster.defaults.conf as ${ONLINE_DEPLOY_CUBESTACK_OPERATOR:-false}, so
+    # writing nothing defers to whatever that default becomes, and a run that
+    # asked for offline must stay offline if a later image flips it.
+    #
+    # NOT folded into the toggle loop above, deliberately: that loop is gated on
+    # truthy(), so the off case would write nothing — exactly the deferral this
+    # avoids.
+    #
+    # And NOT a values-file key — it is absent from CS_VALUES_ALLOWED on purpose,
+    # so the lint refuses a values file that carries it. The mode has to be the
+    # one env-probe checked the NODES against at Step 3, and env-probe takes no
+    # values file at all; a second place to set it is a second answer.
+    online_mode = env("ONLINE_DEPLOY_CUBESTACK_OPERATOR")
+    if online_mode:
+        subst("ONLINE_DEPLOY_CUBESTACK_OPERATOR",
+              "true" if truthy(online_mode) else "false")
+        applied.append("ONLINE_DEPLOY_CUBESTACK_OPERATOR")
+
+    # --- and the credential online mode cannot run without --------------------
+    # Both keys live in the example's LIVE section, so the in-place branch above
+    # rewrites them — there is no relocated-key or commented-block case to work
+    # around here. The mapping is the same shape as SSH_PW -> SSH_DEFAULT_PASSWORD
+    # at the top of this file: the RUN's name for a credential on the left, the
+    # INSTALLER's on the right.
+    #
+    # It is not cosmetic. The operator's own image lives in the private project
+    # suanova-private, and the module that consumes these does not fail when they
+    # are empty: it warns and clears the CR's imagePullSecrets, so the operator
+    # ImagePullBackOffs while the module reports success. `configure` refuses an
+    # online run with no credential, so an empty value here should be
+    # unreachable — it is checked anyway, because the alternative is planting a
+    # broken credential that only surfaces twelve minutes into a deploy.
+    if truthy(online_mode):
+        for key, value in (
+            ("CUBESTACK_OPERATOR_HARBOR_USER", env("HARBOR_RO_USER")),
+            ("CUBESTACK_OPERATOR_HARBOR_PASSWORD", env("HARBOR_RO_PW")),
+        ):
+            if not value:
+                fail(EXIT_MISSING_KEYS, "%s is empty" % key)
+            subst(key, value)
             applied.append(key)
 
     # --- registry storage backend -------------------------------------------
