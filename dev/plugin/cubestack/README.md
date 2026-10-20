@@ -451,7 +451,7 @@ network is fine.
 ## Prerequisites
 
 - **kubectl** and a kubeconfig that can reach the SUANOVA KubeVirt cluster
-- The CubeStack installer image reachable from the cluster (`harbor.isuanova.com/cubestack/cubestack-installer-cli:latest`)
+- The CubeStack installer image reachable from the cluster (`harbor.isuanova.com/suanova/cubestack-installer-cli:latest`)
 - Access to the internal **MinIO** endpoint holding the offline packages (~154 GiB measured
   2026-10-19, including the model-collection and dev-lab groups)
 - **Cubestack box only (on by default):** a **Harbor robot account with pull scope** — it pulls the operator chart from `suanova-private`, which is private and the one project that strictly needs the credential (`suanova` and `mirrors` answer anonymously), and it is passed on to the operator so that the deployed **nodes** can pull the component images from Harbor too, which is this skill's default (`--operator-images offline` opts out). If the account has 2FA, use the **CLI Secret** from the Harbor user profile, not the login password. Put the username and token in a `Write`-authored file and pass it as `--harbor-ro-values`; `--no-operator` skips both the account and the step.

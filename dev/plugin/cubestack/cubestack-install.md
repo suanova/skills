@@ -116,7 +116,7 @@ through Steps 1–7 **without further approval or prompting**.
 | Golden images | `ubuntu-22.04/24.04/26.04-server-amd64-img` in `default` ns |
 | Storage | Rook/Ceph RBD; SC `ceph-rbd-kubevirt` (RWX Block) |
 | Harbor (installer img) | `harbor.isuanova.com` |
-| Installer image | `harbor.isuanova.com/cubestack/cubestack-installer-cli:latest` |
+| Installer image | `harbor.isuanova.com/suanova/cubestack-installer-cli:latest` |
 | Harbor (platform) | `harbor.isuanova.com` — projects `suanova-private` (**private**: the operator chart), `suanova` (component images), `mirrors` (external images). Both of the latter answer anonymously, so only `suanova-private` strictly needs the credential |
 | MinIO (offline pkgs) | endpoint `http://192.168.16.6:9000`, access key `admin`, secret key `Suanova@123`, bucket `cubestack-installer`, dir `offline-files` |
 

@@ -11,7 +11,7 @@
 
 CS_NS="${CS_NS:-default}"
 CS_POD_PREFIX="${CS_POD_PREFIX:-cubestack-install}"
-CS_IMAGE_DEFAULT="harbor.isuanova.com/cubestack/cubestack-installer-cli:latest"
+CS_IMAGE_DEFAULT="harbor.isuanova.com/suanova/cubestack-installer-cli:latest"
 CS_HARBOR_DEFAULT="harbor.isuanova.com"
 
 # The deployed cluster's kubeconfig, as the pod sees it. Four scripts need this
