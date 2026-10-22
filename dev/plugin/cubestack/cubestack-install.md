@@ -1548,10 +1548,11 @@ chart would leave the old binary running and the same Degraded state behind it.
 
 What the pair does, in order, and why the order is not negotiable:
 
-- **`operator-up` prefers the offline bundle's chart**, at
+- **`operator-up` uses the offline bundle's chart on offline runs**
+  (`OPERATOR_IMAGES=offline`), at
   `/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts/<chart>-<version>.tgz`
-  (`fetch-offline` pulls it). When present, it installs that local copy and skips the Harbor
-  login. Otherwise it falls back to
+  (`fetch-offline` pulls it). It installs that local copy and skips the Harbor
+  registry login. Online runs keep pulling
   `oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart`,
   using the robot credential from the run's file — staged into the pod as a mode-600 file,
   hash-verified, and shredded on every exit path. The credential is read **inside** the pod, so

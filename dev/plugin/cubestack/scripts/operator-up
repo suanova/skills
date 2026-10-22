@@ -83,8 +83,8 @@ CS_CHART_NAME="cubestack-operator-chart"
 # and if the rolling version is bumped, this constant has to move with it.
 CS_CHART_VERSION="1.0.0-latest"
 # The installer's offline bundle carries the same chart under this path (inside
-# the bootstrap pod). Prefer it when present so a site with no pod→Harbor path
-# can still install the operator; fall back to the OCI reference otherwise.
+# the bootstrap pod). Offline runs use it; online runs keep pulling the OCI
+# reference so a stale bundle copy cannot shadow a fresh chart.
 CS_CHART_BUNDLE_DIR="/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts"
 CS_RELEASE="cubestack-operator"
 CS_OPERATOR_NS="cubestack-system"
@@ -126,9 +126,10 @@ operator-up [options]
   --run ID         the run being installed into (default: this run's id)
   --pod NAME       installer pod (default: this run's, <prefix>-<run-id>)
   --chart OCI-REF|PATH
-                   the operator chart. Default: the offline bundle's
-                   <chart>-<version>.tgz under the bootstrap pod if present,
-                   otherwise oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart
+                   the operator chart. Default: on offline runs
+                   (OPERATOR_IMAGES=offline) the offline bundle's
+                   <chart>-<version>.tgz if present; otherwise
+                   oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart
   --version V      chart version (default 1.0.0-latest, the rolling tag; a
                    release publishes the bare X.Y.Z)
   --release NAME   helm release name (default cubestack-operator)
@@ -205,6 +206,11 @@ done
 if [ -z "$VALUES" ]; then
   VALUES="$(cs_run_env_get HARBOR_RO_VALUES_FILE)"
 fi
+# The image mode recorded by preflight also decides the default chart source:
+# an offline run uses the bundle; an online run keeps pulling from Harbor so a
+# stale bundle copy cannot shadow a freshly published chart.
+OPERATOR_IMAGES="$(cs_run_env_get OPERATOR_IMAGES)"
+case "$OPERATOR_IMAGES" in offline|online) ;; *) OPERATOR_IMAGES=online ;; esac
 # Deliberately NOT required here. The requirement belongs to the INSTALL path,
 # which the adopt-detection below decides at run time: an ADOPT run touches
 # Harbor not at all, so gating it on a credential it will never use would fail
@@ -278,6 +284,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     cs_note "  values     (unset — run.env has no HARBOR_RO_VALUES_FILE; an INSTALL"
     cs_note "              run stops at the requirement below, an ADOPT run needs none)"
   fi
+  cs_note "  images     $OPERATOR_IMAGES"
   cs_note "  registry   $CS_OPERATOR_REGISTRY   (robot user present, never printed)"
   if [ -n "$CHART" ]; then
     case "$CHART" in
@@ -285,7 +292,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
       *)       cs_note "  chart      $CHART" ;;
     esac
   else
-    cs_note "  chart      auto: offline bundle $LOCAL_CHART if present, else oci://...:$VERSION"
+    cs_note "  chart      auto: offline bundle $LOCAL_CHART if OPERATOR_IMAGES=offline, else oci://...:$VERSION"
   fi
   cs_note "  release    $RELEASE -n $OP_NS"
   cs_note "  secret     $PULL_SECRET in: $OP_NS $CS_COMPONENT_NS"
@@ -399,17 +406,21 @@ if [ "$(probe_det helmrel)" = "1" ]; then
   esac
 fi
 
-# Resolve the default chart now that the pod is known. The offline bundle copy
-# wins when present: an install path on a site with no pod->Harbor route can
-# still get the chart. An explicit --chart was already validated and is used
-# as-is.
+# Resolve the default chart now that the pod is known. Offline runs use the
+# bundle copy; online runs keep pulling the OCI reference. An explicit --chart
+# was already validated and is used as-is.
 if [ "$ADOPT" -eq 0 ] && [ -z "$CHART" ]; then
-  if [ "$(probe_kv localchart)" = "1" ]; then
-    CHART="$LOCAL_CHART"
-    cs_note "  chart      $CHART (offline bundle)"
+  if [ "$OPERATOR_IMAGES" = "offline" ]; then
+    if [ "$(probe_kv localchart)" = "1" ]; then
+      CHART="$LOCAL_CHART"
+      cs_note "  chart      $CHART (offline bundle; OPERATOR_IMAGES=offline)"
+    else
+      cs_fail E_OPERATOR_CHART_MISSING "chart=$LOCAL_CHART" recover=stop-report:user \
+        hint="this run is offline but the offline bundle has no chart; run fetch-offline (it pulls offline-files/cubestack-operator/charts), then re-invoke"
+    fi
   else
     CHART="oci://$CS_OPERATOR_REGISTRY/$CS_CHART_PROJECT/$CS_CHART_NAME"
-    cs_note "  chart      $CHART:$VERSION (Harbor; local chart not found in the offline bundle)"
+    cs_note "  chart      $CHART:$VERSION (Harbor; OPERATOR_IMAGES=$OPERATOR_IMAGES)"
   fi
 fi
 
