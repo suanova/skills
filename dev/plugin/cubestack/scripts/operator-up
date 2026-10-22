@@ -82,6 +82,10 @@ CS_CHART_NAME="cubestack-operator-chart"
 # tag exists today. `--version` overrides this the moment a release is cut --
 # and if the rolling version is bumped, this constant has to move with it.
 CS_CHART_VERSION="1.0.0-latest"
+# The installer's offline bundle carries the same chart under this path (inside
+# the bootstrap pod). Offline runs use it; online runs keep pulling the OCI
+# reference so a stale bundle copy cannot shadow a fresh chart.
+CS_CHART_BUNDLE_DIR="/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts"
 CS_RELEASE="cubestack-operator"
 CS_OPERATOR_NS="cubestack-system"
 CS_PULL_SECRET="harbor-credentials"
@@ -121,8 +125,12 @@ operator-up [options]
                    (HARBOR_RO_VALUES_FILE), so it is normally not passed again.
   --run ID         the run being installed into (default: this run's id)
   --pod NAME       installer pod (default: this run's, <prefix>-<run-id>)
-  --chart OCI-REF  the operator chart (default
-                   oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart)
+  --chart OCI-REF|PATH
+                   the operator chart. Offline runs (OPERATOR_IMAGES=offline)
+                   require the offline bundle's <chart>-<version>.tgz and fail
+                   with E_OPERATOR_CHART_MISSING if it is absent; online runs
+                   default to
+                   oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart
   --version V      chart version (default 1.0.0-latest, the rolling tag; a
                    release publishes the bare X.Y.Z)
   --release NAME   helm release name (default cubestack-operator)
@@ -199,23 +207,30 @@ done
 if [ -z "$VALUES" ]; then
   VALUES="$(cs_run_env_get HARBOR_RO_VALUES_FILE)"
 fi
+# The image mode recorded by preflight also decides the default chart source:
+# an offline run uses the bundle; an online run keeps pulling from Harbor so a
+# stale bundle copy cannot shadow a freshly published chart.
+OPERATOR_IMAGES="$(cs_run_env_get OPERATOR_IMAGES)"
+case "$OPERATOR_IMAGES" in offline|online) ;; *) OPERATOR_IMAGES=online ;; esac
 # Deliberately NOT required here. The requirement belongs to the INSTALL path,
 # which the adopt-detection below decides at run time: an ADOPT run touches
 # Harbor not at all, so gating it on a credential it will never use would fail
 # it -- on a rotated file, or on a Harbor the pod cannot reach -- for a reason
 # it can never act on. The check moves below, still ahead of the budget.
 
-if [ -z "$CHART" ]; then
-  CHART="oci://$CS_OPERATOR_REGISTRY/$CS_CHART_PROJECT/$CS_CHART_NAME"
-fi
+# The default chart is resolved after the pod is known (offline bundle first,
+# OCI second). An explicit --chart is authoritative.
+LOCAL_CHART="$CS_CHART_BUNDLE_DIR/${CS_CHART_NAME}-${VERSION}.tgz"
 
 # --- deterministic validation, BEFORE the budget -----------------------------
 # The configure/pod-up rule: a usage error must never burn an attempt, and the
 # fix-values verb these checks prescribe must stay executable. Every one of
 # these is local and free.
 case "$CHART" in
+  '') ;;
   oci://*) ;;
-  *) cs_usage_fail "--chart must be an oci:// reference (got '$CHART')" ;;
+  /*) ;;
+  *) cs_usage_fail "--chart must be an oci:// reference or an absolute path inside the bootstrap pod (got '$CHART')" ;;
 esac
 case "$CHART" in *[[:space:]]*|*"'"*|*'"'*)
   cs_usage_fail "--chart must not contain whitespace or quotes" ;;
@@ -270,8 +285,16 @@ if [ "$DRY_RUN" -eq 1 ]; then
     cs_note "  values     (unset — run.env has no HARBOR_RO_VALUES_FILE; an INSTALL"
     cs_note "              run stops at the requirement below, an ADOPT run needs none)"
   fi
+  cs_note "  images     $OPERATOR_IMAGES"
   cs_note "  registry   $CS_OPERATOR_REGISTRY   (robot user present, never printed)"
-  cs_note "  chart      $CHART:$VERSION"
+  if [ -n "$CHART" ]; then
+    case "$CHART" in
+      oci://*) cs_note "  chart      $CHART:$VERSION" ;;
+      *)       cs_note "  chart      $CHART" ;;
+    esac
+  else
+    cs_note "  chart      auto: offline bundle $LOCAL_CHART if OPERATOR_IMAGES=offline, else oci://...:$VERSION"
+  fi
   cs_note "  release    $RELEASE -n $OP_NS"
   cs_note "  secret     $PULL_SECRET in: $OP_NS $CS_COMPONENT_NS"
   cs_note "             (dockerconfigjson, host $CS_OPERATOR_REGISTRY; the kubelet reads"
@@ -306,11 +329,12 @@ cs_pod_require "$POD_ARG"
 # The deploy pattern: one exec answers every cheap question, so a 3-second
 # verdict replaces a failure discovered after helm has already run.
 PRE="$(cs_pod_exec "$CS_POD" bash -c '
-  K="$1"
+  K="$1"; L="$2"
   if [ -f "$K" ]; then echo kconf=1; else echo kconf=0; fi
   if command -v helm >/dev/null 2>&1; then echo helm=1; else echo helm=0; fi
-  if command -v base64 >/dev/null 2>&1; then echo base64=1; else echo base64=0; fi' \
-  _ "$CS_KCONF")"
+  if command -v base64 >/dev/null 2>&1; then echo base64=1; else echo base64=0; fi
+  if [ -f "$L" ]; then echo localchart=1; else echo localchart=0; fi' \
+  _ "$CS_KCONF" "$LOCAL_CHART")"
 probe_kv() { printf '%s\n' "$PRE" | sed -n "s/^$1=//p" | tail -1; }
 
 [ "$(probe_kv kconf)" = "1" ] || cs_fail E_OPERATOR_PRECOND_CLUSTER "pod=$CS_POD" "kubeconfig=$CS_KCONF" \
@@ -381,6 +405,24 @@ if [ "$(probe_det helmrel)" = "1" ]; then
            recover="rerun:operator-up" \
            hint="release $RELEASE exists but its manifest could not be read, so this run cannot tell whether it manages a CubeStackCluster; see $(cs_log_file)" ;;
   esac
+fi
+
+# Resolve the default chart now that the pod is known. Offline runs use the
+# bundle copy; online runs keep pulling the OCI reference. An explicit --chart
+# was already validated and is used as-is.
+if [ "$ADOPT" -eq 0 ] && [ -z "$CHART" ]; then
+  if [ "$OPERATOR_IMAGES" = "offline" ]; then
+    if [ "$(probe_kv localchart)" = "1" ]; then
+      CHART="$LOCAL_CHART"
+      cs_note "  chart      $CHART (offline bundle; OPERATOR_IMAGES=offline)"
+    else
+      cs_fail E_OPERATOR_CHART_MISSING "chart=$LOCAL_CHART" recover=stop-report:user \
+        hint="this run is offline but the offline bundle has no chart; run fetch-offline (it pulls offline-files/cubestack-operator/charts), then re-invoke"
+    fi
+  else
+    CHART="oci://$CS_OPERATOR_REGISTRY/$CS_CHART_PROJECT/$CS_CHART_NAME"
+    cs_note "  chart      $CHART:$VERSION (Harbor; OPERATOR_IMAGES=$OPERATOR_IMAGES)"
+  fi
 fi
 
 # --- the credential requirement belongs to the INSTALL path -------------------
@@ -482,36 +524,42 @@ if [ "$ADOPT" -eq 0 ]; then
          hint="could not build the registry artifacts in the pod; see $(cs_log_file)" ;;
   esac
 
-  # --- helm registry login ----------------------------------------------------
-  # cs_pod_exec (folded), not _out: the failure TEXT carries the classification.
-  # $? is read on the immediately following line.
-  #
-  # HELM_REGISTRY_CONFIG is exported INSIDE the remote shell and points at the
-  # staged, shredded directory. That is load-bearing twice: it keeps helm's
-  # credential file out of $HOME/.config/helm/registry/config.json (which nothing
-  # would remove), and it means the `helm upgrade --install` below finds the same
-  # credential without a second login.
-  LOGIN_OUT="$(cs_pod_exec "$CS_POD" bash -c '
-    . "$1" || exit 19
-    export HELM_REGISTRY_CONFIG="$2"
-    helm registry login "$3" -u "$HARBOR_RO_USER" --password-stdin < "$4"' \
-    _ "$POD_VALUES" "$POD_REG" "$CS_OPERATOR_REGISTRY" "$POD_PW" 2>&1)"
-  LOGIN_RC=$?
+  if [ "${CHART#oci://}" = "$CHART" ]; then
+    # Local chart: no registry login is needed (it is only for pulling the
+    # chart). The image pull Secret below is still built and applied.
+    cs_note "  helm login skipped: using the local chart $CHART"
+  else
+    # --- helm registry login --------------------------------------------------
+    # cs_pod_exec (folded), not _out: the failure TEXT carries the classification.
+    # $? is read on the immediately following line.
+    #
+    # HELM_REGISTRY_CONFIG is exported INSIDE the remote shell and points at the
+    # staged, shredded directory. That is load-bearing twice: it keeps helm's
+    # credential file out of $HOME/.config/helm/registry/config.json (which nothing
+    # would remove), and it means the `helm upgrade --install` below finds the same
+    # credential without a second login.
+    LOGIN_OUT="$(cs_pod_exec "$CS_POD" bash -c '
+      . "$1" || exit 19
+      export HELM_REGISTRY_CONFIG="$2"
+      helm registry login "$3" -u "$HARBOR_RO_USER" --password-stdin < "$4"' \
+      _ "$POD_VALUES" "$POD_REG" "$CS_OPERATOR_REGISTRY" "$POD_PW" 2>&1)"
+    LOGIN_RC=$?
 
-  if [ "$LOGIN_RC" != "0" ]; then
-    case "$LOGIN_OUT" in
-      *401*|*Unauthorized*|*unauthorized*|*'authentication required'*)
-        cs_fail E_OPERATOR_HARBOR_AUTH "registry=$CS_OPERATOR_REGISTRY" \
-          recover="fix-values:$VALUES:HARBOR_RO_USER,HARBOR_RO_PW" \
-          hint="Harbor rejected the robot credential; re-Write $VALUES with the right user and password, then re-invoke" ;;
-      *403*|*Forbidden*|*forbidden*|*DENIED*|*denied*)
-        cs_fail E_OPERATOR_HARBOR_DENIED "registry=$CS_OPERATOR_REGISTRY" recover=stop-report:admin \
-          hint="the robot account authenticated but is not permitted to pull from $CS_OPERATOR_REGISTRY/$CS_CHART_PROJECT (and $CS_OPERATOR_REGISTRY/suanova, $CS_OPERATOR_REGISTRY/mirrors); grant it pull on all three projects" ;;
-      *)
-        cs_fail E_OPERATOR_HARBOR_LOGIN "registry=$CS_OPERATOR_REGISTRY" "rc=$LOGIN_RC" \
-          recover=rerun:env-probe \
-          hint="helm could not reach $CS_OPERATOR_REGISTRY from the pod (not an auth rejection); env-probe is the step that proves Harbor reachability - see $(cs_log_file)" ;;
-    esac
+    if [ "$LOGIN_RC" != "0" ]; then
+      case "$LOGIN_OUT" in
+        *401*|*Unauthorized*|*unauthorized*|*'authentication required'*)
+          cs_fail E_OPERATOR_HARBOR_AUTH "registry=$CS_OPERATOR_REGISTRY" \
+            recover="fix-values:$VALUES:HARBOR_RO_USER,HARBOR_RO_PW" \
+            hint="Harbor rejected the robot credential; re-Write $VALUES with the right user and password, then re-invoke" ;;
+        *403*|*Forbidden*|*forbidden*|*DENIED*|*denied*)
+          cs_fail E_OPERATOR_HARBOR_DENIED "registry=$CS_OPERATOR_REGISTRY" recover=stop-report:admin \
+            hint="the robot account authenticated but is not permitted to pull from $CS_OPERATOR_REGISTRY/$CS_CHART_PROJECT (and $CS_OPERATOR_REGISTRY/suanova, $CS_OPERATOR_REGISTRY/mirrors); grant it pull on all three projects" ;;
+        *)
+          cs_fail E_OPERATOR_HARBOR_LOGIN "registry=$CS_OPERATOR_REGISTRY" "rc=$LOGIN_RC" \
+            recover=rerun:env-probe \
+            hint="helm could not reach $CS_OPERATOR_REGISTRY from the pod (not an auth rejection); env-probe is the step that proves Harbor reachability - see $(cs_log_file)" ;;
+      esac
+    fi
   fi
 
   # --- namespaces + the image pull Secret, BEFORE the chart -------------------
@@ -604,21 +652,31 @@ if [ "$ADOPT" -eq 0 ]; then
   HELM_OUT_FILE="$(cs_run_dir)/operator-up.helm.out"
   mkdir -p "$(dirname "$HELM_OUT_FILE")" 2>/dev/null || true
   helm_capture() { "$@" > "$HELM_OUT_FILE" 2>&1; }
+  # --version is meaningful only for an OCI/repo chart; helm ignores it (and
+  # warns) for a local .tgz, so omit it there.
+  HELM_VER=""
+  [ "${CHART#oci://}" != "$CHART" ] && HELM_VER="$VERSION"
   cs_wait_cmd helm_capture cs_pod_exec "$CS_POD" bash -c '
     K="$1"; REGCFG="$2"; REL="$3"; CHART="$4"; VER="$5"; NS="$6"; PULL="$7"
     export HELM_REGISTRY_CONFIG="$REGCFG"
-    helm upgrade --install "$REL" "$CHART" --version "$VER" -n "$NS" --create-namespace \
+    set -- upgrade --install "$REL" "$CHART"
+    if [ -n "$VER" ]; then set -- "$@" --version "$VER"; fi
+    set -- "$@" -n "$NS" --create-namespace \
       --kubeconfig="$K" --wait --timeout 5m \
       --set imagePullSecrets[0].name="$PULL" \
       --set image.pullPolicy=Always \
-      --set clusterCR.enabled=false' \
-    _ "$CS_KCONF" "$POD_REG" "$RELEASE" "$CHART" "$VERSION" "$OP_NS" "$PULL_SECRET"
+      --set clusterCR.enabled=false
+    helm "$@"' \
+    _ "$CS_KCONF" "$POD_REG" "$RELEASE" "$CHART" "$HELM_VER" "$OP_NS" "$PULL_SECRET"
   HELM_RC=$?
   HELM_OUT="$(cat "$HELM_OUT_FILE" 2>/dev/null)"
   cs_logged printf '%s\n' "$HELM_OUT"
 
   if [ "$HELM_RC" != "0" ]; then
     case "$HELM_OUT" in
+      *'no such file or directory'*|*'path "'*'not found'*)
+        cs_fail E_OPERATOR_CHART_MISSING "chart=$CHART" recover=stop-report:user \
+          hint="the local chart path does not exist in the bootstrap pod; run fetch-offline (it pulls offline-files/cubestack-operator/charts) or pass --chart oci://..." ;;
       *'not found'*|*'manifest unknown'*|*'no such'*|*'unexpected status from HEAD'*)
         cs_fail E_OPERATOR_CHART_MISSING "chart=$CHART" "version=$VERSION" recover=stop-report:user \
           hint="the chart version is not in the OCI repository; a version typo or an unpublished chart is not fixed by a retry - the rolling tag is <Chart.yaml version>-latest and a release publishes the bare X.Y.Z, so try the other one with --version" ;;
