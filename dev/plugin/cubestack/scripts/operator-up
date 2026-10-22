@@ -126,9 +126,10 @@ operator-up [options]
   --run ID         the run being installed into (default: this run's id)
   --pod NAME       installer pod (default: this run's, <prefix>-<run-id>)
   --chart OCI-REF|PATH
-                   the operator chart. Default: on offline runs
-                   (OPERATOR_IMAGES=offline) the offline bundle's
-                   <chart>-<version>.tgz if present; otherwise
+                   the operator chart. Offline runs (OPERATOR_IMAGES=offline)
+                   require the offline bundle's <chart>-<version>.tgz and fail
+                   with E_OPERATOR_CHART_MISSING if it is absent; online runs
+                   default to
                    oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart
   --version V      chart version (default 1.0.0-latest, the rolling tag; a
                    release publishes the bare X.Y.Z)
