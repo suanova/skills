@@ -227,6 +227,18 @@ def main():
         subst(key, value, append=True)
         applied.append(key)
 
+    # --- release tree (optional) -------------------------------------------
+    # preflight records the version and configure passes both through the
+    # environment. Without them the deploy reads deployments/offline-files/, the
+    # rolling dev tree. A release-capable installer declares both keys in
+    # cluster.defaults.conf; append=True also keeps an older installer, which has
+    # no such keys, from failing a dev run.
+    for key in ("CUBESTACK_RELEASE", "CUBESTACK_RELEASE_ROOT"):
+        value = env(key)
+        if value:
+            subst(key, value, append=True)
+            applied.append(key)
+
     # --- NODES --------------------------------------------------------------
     nodes = []
     if env("NODES_MASTER"):
