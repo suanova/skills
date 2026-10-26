@@ -84,6 +84,16 @@ preflight [options]
                    credential above; with --no-operator there is no credential,
                    so such a run resolves to offline. `--operator-images
                    offline` is the explicit opt-out.
+  --release VERSION
+                   install a published offline release instead of the rolling
+                   dev channel: the tree under <release-root>/<VERSION>/
+                   offline-files/ replaces deployments/offline-files/ for this
+                   run. Step 5 fetches it, Step 4 writes it into cluster.conf,
+                   and operator-up takes its chart from it. Omit for dev.
+  --release-root DIR
+                   local bucket root holding <VERSION>/ trees (default:
+                   /opt/cubestack-installer/offline-releases, the installer's
+                   own default). Only meaningful with --release.
   --no-operator    build only a k8s box: skip the Step 7 cubestack-box install
                    (cubestack-operator + the CubeStackCluster CR). The run then
                    ends at verify, with a verified k8s box and no platform.
@@ -125,6 +135,11 @@ HARBOR_RO_VALUES=""
 # resolved after the credential block below, because its default depends on
 # whether this run has a credential to pull with at all.
 OPERATOR_IMAGES=""
+# Empty means "the rolling dev channel": the run reads deployments/offline-files/
+# and lets operator-up fall back to that chart copy. A release name redirects all
+# three consumers (fetch, cluster.conf, operator-up) to the versioned tree.
+RELEASE=""
+RELEASE_ROOT=""
 RUN_ID=""
 
 while [ $# -gt 0 ]; do
@@ -144,12 +159,41 @@ while [ $# -gt 0 ]; do
     --cephfs-mount-guide) cs_need_val "$@"; CEPHFS_GUIDE="${2:-}"; shift 2 ;;
     --harbor-ro-values) cs_need_val "$@";   HARBOR_RO_VALUES="${2:-}"; shift 2 ;;
     --operator-images) cs_need_val "$@";    OPERATOR_IMAGES="${2:-}"; shift 2 ;;
+    --release) cs_need_val "$@";            RELEASE="${2:-}"; shift 2 ;;
+    --release-root) cs_need_val "$@";       RELEASE_ROOT="${2:-}"; shift 2 ;;
     --no-operator)        OPERATOR=0; shift ;;
     --run) cs_need_val "$@";     RUN_ID="${2:-}"; shift 2 ;;
     -h|--help) usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
   esac
 done
+
+# --- release selection ------------------------------------------------------
+# The installer validates this same shape before it sources release.env, and the
+# name becomes a path component (<root>/<version>/offline-files). Rejecting it
+# here keeps a malformed value from reaching fetch, configure and deploy, where
+# each would otherwise have to repeat the check.
+if [ -n "$RELEASE" ]; then
+  case "$RELEASE" in
+    [0-9A-Za-z]*) ;;
+    *) cs_usage_fail "--release must start with a letter or digit (got '$RELEASE')" ;;
+  esac
+  case "$RELEASE" in
+    *[!0-9A-Za-z._-]*) cs_usage_fail "--release may only contain letters, digits, dot, underscore and hyphen (got '$RELEASE')" ;;
+  esac
+  if [ -n "$RELEASE_ROOT" ]; then
+    case "$RELEASE_ROOT" in
+      /*) ;;
+      *) cs_usage_fail "--release-root must be an absolute path (got '$RELEASE_ROOT')" ;;
+    esac
+    case "$RELEASE_ROOT" in
+      *[[:space:]]*|*"'"*|*'"'*)
+        cs_usage_fail "--release-root must not contain whitespace or quotes" ;;
+    esac
+  fi
+else
+  [ -z "$RELEASE_ROOT" ] || cs_usage_fail "--release-root requires --release"
+fi
 
 # --- shape defaults ---------------------------------------------------------
 # The default shape depends on the NODE COUNT, because a 1-node box is a
@@ -487,6 +531,8 @@ cs_run_env_put \
   "CEPHFS_GUIDE_FILE=$(cs_q "$CEPHFS_GUIDE")" \
   "OPERATOR_ENABLED=$(cs_q "$OPERATOR")" \
   "OPERATOR_IMAGES=$(cs_q "$OPERATOR_IMAGES")" \
+  "CUBESTACK_RELEASE=$(cs_q "$RELEASE")" \
+  "CUBESTACK_RELEASE_ROOT=$(cs_q "$RELEASE_ROOT")" \
   "HARBOR_RO_VALUES_FILE=$(cs_q "$HARBOR_RO_VALUES")" \
   "POOL=$(cs_q "$POOL")" \
   "VM_NAMES=$(cs_q "$VM_NAMES")"
@@ -519,6 +565,7 @@ CONFIRM — resolved prerequisites (nothing has been created yet)
   expose        $EXPOSE$([ "$EXPOSE" = "metallb" ] && echo "   (VIP block reserved at Step 1b from the host's IPAM; --count there sets how many)")
   Harbor        $HARBOR
   operator img  $OPERATOR_IMG_LINE
+  release       $([ -n "$RELEASE" ] && echo "$RELEASE   (offline tree: ${RELEASE_ROOT:-/opt/cubestack-installer/offline-releases}/$RELEASE/offline-files)" || echo "none   (rolling dev channel: deployments/offline-files)")
   MinIO         ${MINIO_EP:-<not set — required before fetch-offline>}
   external Ceph $([ "$EXTERNAL_CEPH" = "1" ] && echo yes || echo no)${EXTERNAL_CEPH_ENV:+   (official import: $(basename "$EXTERNAL_CEPH_ENV"))}
   models mount  $([ -n "$CEPHFS_GUIDE" ] && echo "yes   ($(basename "$CEPHFS_GUIDE") -> /models on every node)" || echo "no    (Step 7 skips it)")
@@ -538,6 +585,7 @@ cs_ok "run=$RUN_ID" "index=$INDEX" "nodes=$NODES" "subnet=$SUBNET" \
       "models_mount=$([ -n "$CEPHFS_GUIDE" ] && echo on || echo off)" \
       "operator=$([ "$OPERATOR" = "1" ] && echo on || echo off)" \
       "operator_images=$OPERATOR_IMAGES" \
+      "release=$([ -n "$RELEASE" ] && echo "$RELEASE" || echo dev)" \
       "harbor_ro=$([ -n "$HARBOR_RO_VALUES" ] && echo 1 || echo 0)" \
       "run_state=$RUN_STATE" \
       "run_dir=$(cs_run_dir)"

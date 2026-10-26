@@ -195,6 +195,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen components** (all but `exporters.bmc`, which needs an admin-created Secret — see Step 7), *or adopts the platform the deploy already installed if it installed one* (see Step 7). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
 | 12 | Harbor read-only robot credential | **required while #11 is on** — a file with `HARBOR_RO_USER` / `HARBOR_RO_PW`, passed as `--harbor-ro-values`. Author it with `Write` **before running `preflight`**, like the two Provider files above, so `preflight` can lint it while the user is still in the room |
 | 13 | Operator image source | **`online`** — the operator and every component image come from `harbor.isuanova.com`, pulled by the **nodes**, which is what makes #12 load-bearing. Not the switch for whether a platform is installed (that is #11, and it is on); only where its images come from. `--operator-images offline` opts out and takes the installer's own default — an offline tar pushed into the box's in-cluster registry, needing neither the credential nor a node→Harbor path. **Step 3 checks** the path this needs — see *The operator's images* under the values file |
+| 14 | Offline release version | **none — the rolling dev channel** (`deployments/offline-files/`). `--release <version>` installs a published tree instead: `<release-root>/<version>/offline-files/`, defaulting the root to the installer's own `/opt/cubestack-installer/offline-releases`. The flag drives Steps 4–7 together — `configure` writes it into `cluster.conf`, `fetch-offline` fetches that tree, and `operator-up` takes its chart from it. `--release-root` is only for a tree outside the default root |
 
 Then resolve everything with one read-only call and confirm the printed plan:
 
@@ -208,6 +209,13 @@ Pass `--minio-ep` from the Cluster facts table **every time**. It is not optiona
 practice: `preflight` records it as `MINIO_EP` in `run.env`, and Step 3's `env-probe`
 reads that key. Omit it and `env-probe` fails `E_USAGE` with
 `--minio-ip is required (not set on the command line or in run.env)`.
+
+To install a published release, add `--release <version>` (for example `2.0.0-rc2`);
+`--release-root` is needed only when the tree is not under the installer's default
+`/opt/cubestack-installer/offline-releases`. The one flag then carries through the rest
+of the run: Step 4 writes `CUBESTACK_RELEASE` into `cluster.conf`, Step 5 fetches
+`<root>/<version>/offline-files/`, and `operator-up` reads the chart from that tree.
+Omit it to keep the rolling dev channel.
 
 `--harbor-ro-values` is **not** optional unless `--no-operator` is also given: the file
 *is* the switch that turns Step 7 on, so omitting it from a cubestack-box run is `E_USAGE`
@@ -1236,6 +1244,12 @@ so a re-run whose request has gone missing *and* whose run has already deployed 
 "$S/pod-up" --run <run-id>          # --subnet defaults to run.env SUBNET
 ```
 
+> **A release run needs the release's own CLI image.** `pod-up` defaults to the rolling
+> `cubestack-installer-cli:latest`, but a release tree pins the matching image in its
+> `release.env` (`CUBESTACK_CLI_IMAGE`). Pass it as `--image <that ref>`: the pod's
+> `fetch-offline-from-minio.sh` is what reads the tree, and only the release's image is
+> guaranteed to know the tree's current layout (the versioned CLI tar).
+
 > **Omit `--subnet` once `preflight` has run.** `run.env` already holds it, and passing the
 > wrong value is costly rather than merely wrong. The value is the **label** preflight
 > printed as `subnet=` (e.g. `10-66-3-0`). A label mismatch reads as subnet drift, so `pod-up`
@@ -1338,6 +1352,12 @@ author nor edit it.
 > the rewriter the two `CUBESTACK_OPERATOR_HARBOR_USER`/`_PASSWORD` keys; the pod-side copy is
 > shredded on every exit path, the same as the values file. The verdict reports `images=online|offline`.
 
+> **`CUBESTACK_RELEASE` follows the same rule.** When Step 0 was given `--release`, `configure`
+> injects that version into `cluster.conf` from `run.env`; a `CUBESTACK_RELEASE` in the values file
+> is not honoured, so `fetch-offline`, `configure` and `operator-up` cannot end up on different
+> trees. Without a release the key is absent and `cluster.defaults.conf` keeps the dev path.
+> The verdict reports `release=<version>` or `release=dev`.
+
 When Step 0 was given `--external-ceph-env`, `configure` also places that file — it reads the
 path from the run dir, so **you do not pass it again** — and hash-verifies the copy. It is left
 in place deliberately: the installer sources it mid-deploy. `pod-down` removes it.
@@ -1371,6 +1391,16 @@ Seeds `deployments/config/minio.conf` (which is what the fetch actually reads �
 `cluster.conf`) via a repo helper, byte-gates it, then fetches the offline tree. Idempotent: `du`
 on `offline-files/` is the only evidence a prior fetch completed, so a re-run above the floor
 returns `skipped=1`. A partial tree is `E_FETCH_PARTIAL`, never silently accepted.
+
+> **A release run fetches a versioned tree instead.** When Step 0 recorded `CUBESTACK_RELEASE`,
+> `fetch-offline` calls `fetch-offline-from-minio.sh --release <version> --dest <root>`, and the
+> tree lands at `<root>/<version>/offline-files/` with the CLI tar beside it
+> (`cubestack-installer-cli-v<version>.tar`; the older unversioned
+> `cubestack-installer-cli.tar` is still accepted). Completeness is `_SUCCESS` plus a
+> `release.env` naming the version plus that tar — the dev `--floor` and the 15 GiB discussion
+> below do **not** apply. A tree that is already complete returns `skipped=1`; an incomplete one
+> is `E_FETCH_PARTIAL`. Both the dev and release paths read the version from `run.env`, so Step 4
+> and Step 5 stay independent and can run in parallel.
 
 **The floor is the operative number, not any GiB figure in this document.** `deploy` refuses to
 launch below **15360 MiB** (`CS_FETCH_FLOOR_MB`); the fetch script carries its own `--floor`
@@ -1548,10 +1578,14 @@ chart would leave the old binary running and the same Degraded state behind it.
 
 What the pair does, in order, and why the order is not negotiable:
 
-- **`operator-up` uses the offline bundle's chart by default on offline runs**
-  (`OPERATOR_IMAGES=offline`), at
-  `/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts/<chart>-<version>.tgz`
-  (`fetch-offline` pulls it). It installs that local copy and skips the Harbor
+- **`operator-up` uses the active offline tree's chart by default on offline runs**
+  (`OPERATOR_IMAGES=offline`). On a dev run that is
+  `/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts/<chart>-<version>.tgz`;
+  when the run has `CUBESTACK_RELEASE` it is
+  `${CUBESTACK_RELEASE_ROOT:-/opt/cubestack-installer/offline-releases}/<version>/offline-files/cubestack-operator/charts/<chart>-<version>.tgz`.
+  The chart version in that case comes from the tree's `release.env`
+  (`CUBESTACK_OPERATOR_CHART_VERSION`); `operator-up` reads it unless `--version` is given.
+  `fetch-offline` pulls whichever tree the run selected. It installs that local copy and skips the Harbor
   registry login. An explicit local `--chart` also skips chart login; an explicit
   OCI `--chart` uses that reference and logs in to Harbor. Online runs keep pulling
   `oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart`,
