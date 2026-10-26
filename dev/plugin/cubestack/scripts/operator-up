@@ -84,8 +84,9 @@ CS_CHART_NAME="cubestack-operator-chart"
 CS_CHART_VERSION="1.0.0-latest"
 # The installer's offline bundle carries the same chart under this path (inside
 # the bootstrap pod). Offline runs use it; online runs keep pulling the OCI
-# reference so a stale bundle copy cannot shadow a fresh chart.
-CS_CHART_BUNDLE_DIR="/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts"
+# reference so a stale bundle copy cannot shadow a fresh chart. Resolved after
+# run.env is read, because a release run takes the chart from its versioned tree.
+CS_CHART_BUNDLE_DIR=""
 CS_RELEASE="cubestack-operator"
 CS_OPERATOR_NS="cubestack-system"
 CS_PULL_SECRET="harbor-credentials"
@@ -127,12 +128,15 @@ operator-up [options]
   --pod NAME       installer pod (default: this run's, <prefix>-<run-id>)
   --chart OCI-REF|PATH
                    the operator chart. Offline runs (OPERATOR_IMAGES=offline)
-                   require the offline bundle's <chart>-<version>.tgz and fail
-                   with E_OPERATOR_CHART_MISSING if it is absent; online runs
-                   default to
+                   require <chart>-<version>.tgz from the active offline tree —
+                   <root>/<release>/offline-files/ when the run has
+                   CUBESTACK_RELEASE, otherwise deployments/offline-files/ — and
+                   fail with E_OPERATOR_CHART_MISSING if it is absent; online
+                   runs default to
                    oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart
   --version V      chart version (default 1.0.0-latest, the rolling tag; a
-                   release publishes the bare X.Y.Z)
+                   release publishes the bare X.Y.Z; a release run defaults to
+                   the tree's CUBESTACK_OPERATOR_CHART_VERSION instead)
   --release NAME   helm release name (default cubestack-operator)
   --namespace NS   where the operator runs (default cubestack-system)
   --pull-secret N  the image pull Secret to create and inject (default
@@ -179,6 +183,10 @@ VALUES=""
 POD_ARG=""
 CHART=""
 VERSION="$CS_CHART_VERSION"
+# Whether the caller named a version. A release run otherwise takes the tree's
+# CUBESTACK_OPERATOR_CHART_VERSION, but an explicit --version — including an
+# explicit 1.0.0-latest — must win.
+VERSION_EXPLICIT=0
 RELEASE="$CS_RELEASE"
 OP_NS="$CS_OPERATOR_NS"
 PULL_SECRET="$CS_PULL_SECRET"
@@ -191,7 +199,7 @@ while [ $# -gt 0 ]; do
     --run) cs_need_val "$@";         cs_run_opt "${2:-}"; shift 2 ;;
     --pod) cs_need_val "$@";         POD_ARG="${2:-}"; shift 2 ;;
     --chart) cs_need_val "$@";       CHART="${2:-}"; shift 2 ;;
-    --version) cs_need_val "$@";     VERSION="${2:-}"; shift 2 ;;
+    --version) cs_need_val "$@";     VERSION="${2:-}"; VERSION_EXPLICIT=1; shift 2 ;;
     --release) cs_need_val "$@";     RELEASE="${2:-}"; shift 2 ;;
     --namespace) cs_need_val "$@";   OP_NS="${2:-}"; shift 2 ;;
     --pull-secret) cs_need_val "$@"; PULL_SECRET="${2:-}"; shift 2 ;;
@@ -212,6 +220,31 @@ fi
 # stale bundle copy cannot shadow a freshly published chart.
 OPERATOR_IMAGES="$(cs_run_env_get OPERATOR_IMAGES)"
 case "$OPERATOR_IMAGES" in offline|online) ;; *) OPERATOR_IMAGES=online ;; esac
+# A release run reads the same relative layout from the versioned tree, and its
+# chart must come from there: the dev copy can be absent, stale or a different
+# version. preflight records the decision; nothing here re-litigates it.
+CUBESTACK_RELEASE="$(cs_run_env_get CUBESTACK_RELEASE)"
+CUBESTACK_RELEASE_ROOT="$(cs_run_env_get CUBESTACK_RELEASE_ROOT)"
+case "$CUBESTACK_RELEASE" in
+  '') ;;
+  [0-9A-Za-z]*) case "$CUBESTACK_RELEASE" in
+                   *[!0-9A-Za-z._-]*) cs_usage_fail "run.env carries a malformed CUBESTACK_RELEASE (re-run preflight)" ;;
+                 esac ;;
+  *) cs_usage_fail "run.env carries a malformed CUBESTACK_RELEASE (re-run preflight)" ;;
+esac
+CUBESTACK_RELEASE_ROOT="${CUBESTACK_RELEASE_ROOT:-/opt/cubestack-installer/offline-releases}"
+case "$CUBESTACK_RELEASE_ROOT" in *[[:space:]]*|*"'"*|*'"'*)
+  cs_usage_fail "run.env carries a CUBESTACK_RELEASE_ROOT with whitespace or quotes (re-run preflight)" ;;
+esac
+if [ -n "$CUBESTACK_RELEASE" ]; then
+  case "$CUBESTACK_RELEASE_ROOT" in
+    /*) ;;
+    *) cs_usage_fail "run.env carries a non-absolute CUBESTACK_RELEASE_ROOT (re-run preflight)" ;;
+  esac
+  CS_CHART_BUNDLE_DIR="${CUBESTACK_RELEASE_ROOT}/${CUBESTACK_RELEASE}/offline-files/cubestack-operator/charts"
+else
+  CS_CHART_BUNDLE_DIR="/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts"
+fi
 # Deliberately NOT required here. The requirement belongs to the INSTALL path,
 # which the adopt-detection below decides at run time: an ADOPT run touches
 # Harbor not at all, so gating it on a credential it will never use would fail
@@ -325,6 +358,19 @@ fi
 cs_kubeconfig_guard
 cs_pod_require "$POD_ARG"
 
+# A release run's chart version lives in the release tree, not in this script's
+# rolling default. Read it from the pod's release.env unless --version was given
+# explicitly (an explicit flag is still authoritative).
+if [ -n "$CUBESTACK_RELEASE" ] && [ "$VERSION_EXPLICIT" = "0" ]; then
+  rel_chart_ver="$(cs_pod_exec "$CS_POD" bash -c \
+    "sed -n 's/^CUBESTACK_OPERATOR_CHART_VERSION=//p' '$CUBESTACK_RELEASE_ROOT/$CUBESTACK_RELEASE/offline-files/release.env' 2>/dev/null | tr -d '\"' | head -1")"
+  case "$rel_chart_ver" in
+    ''|*[!A-Za-z0-9._+-]*) ;;
+    *) VERSION="$rel_chart_ver"
+       LOCAL_CHART="$CS_CHART_BUNDLE_DIR/${CS_CHART_NAME}-${VERSION}.tgz" ;;
+  esac
+fi
+
 # --- pod preconditions, one exec --------------------------------------------
 # The deploy pattern: one exec answers every cheap question, so a 3-second
 # verdict replaces a failure discovered after helm has already run.
@@ -417,7 +463,7 @@ if [ "$ADOPT" -eq 0 ] && [ -z "$CHART" ]; then
       cs_note "  chart      $CHART (offline bundle; OPERATOR_IMAGES=offline)"
     else
       cs_fail E_OPERATOR_CHART_MISSING "chart=$LOCAL_CHART" recover=stop-report:user \
-        hint="this run is offline but the offline bundle has no chart; run fetch-offline (it pulls offline-files/cubestack-operator/charts), then re-invoke"
+        hint="this run is offline but the offline tree has no chart at $LOCAL_CHART; run fetch-offline (it pulls the tree the run's CUBESTACK_RELEASE selects), then re-invoke"
     fi
   else
     CHART="oci://$CS_OPERATOR_REGISTRY/$CS_CHART_PROJECT/$CS_CHART_NAME"
@@ -676,7 +722,7 @@ if [ "$ADOPT" -eq 0 ]; then
     case "$HELM_OUT" in
       *'no such file or directory'*|*'path "'*'not found'*)
         cs_fail E_OPERATOR_CHART_MISSING "chart=$CHART" recover=stop-report:user \
-          hint="the local chart path does not exist in the bootstrap pod; run fetch-offline (it pulls offline-files/cubestack-operator/charts) or pass --chart oci://..." ;;
+          hint="the local chart path $CHART does not exist in the bootstrap pod; run fetch-offline (it pulls the tree the run's CUBESTACK_RELEASE selects) or pass --chart oci://..." ;;
       *'not found'*|*'manifest unknown'*|*'no such'*|*'unexpected status from HEAD'*)
         cs_fail E_OPERATOR_CHART_MISSING "chart=$CHART" "version=$VERSION" recover=stop-report:user \
           hint="the chart version is not in the OCI repository; a version typo or an unpublished chart is not fixed by a retry - the rolling tag is <Chart.yaml version>-latest and a release publishes the bare X.Y.Z, so try the other one with --version" ;;

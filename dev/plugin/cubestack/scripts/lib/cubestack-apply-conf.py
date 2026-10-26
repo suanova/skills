@@ -227,6 +227,20 @@ def main():
         subst(key, value, append=True)
         applied.append(key)
 
+    # --- release tree (optional) -------------------------------------------
+    # preflight records the version and configure passes both through the
+    # environment. Without them the deploy reads deployments/offline-files/, the
+    # rolling dev tree. A release-capable installer declares both keys in
+    # cluster.defaults.conf; append=True also keeps an older installer, which has
+    # no such keys, from failing a dev run. subst() runs even for an empty value:
+    # a dev run over a config written by an earlier release run must clear the
+    # stale selectors rather than leave them behind.
+    for key in ("CUBESTACK_RELEASE", "CUBESTACK_RELEASE_ROOT"):
+        value = env(key)
+        subst(key, value, append=True)
+        if value:
+            applied.append(key)
+
     # --- NODES --------------------------------------------------------------
     nodes = []
     if env("NODES_MASTER"):
@@ -357,8 +371,10 @@ def main():
     #
     # The CEPHFS_* keys below are the one place the EOF-append fallback is still
     # correct: those exist ONLY inside the example's commented block.
+    # K8S_ENABLED is deliberately absent: the installer removed it on 2026-10-16
+    # (it now always installs the k8s base), and a values file written for an
+    # older image still carrying it must not fail a run that cannot change it.
     for key in (
-        "K8S_ENABLED",
         "KUBE_VIP_ENABLED",
         "LWS_ENABLED",
         "NETSHOOT_ENABLED",

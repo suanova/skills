@@ -93,6 +93,33 @@ elif [ -n "$PREV_NODESET" ] && [ "$PREV_NODESET" != "$NODESET" ]; then
 fi
 
 # --- preconditions (cheap, inside the pod, before anything is launched) ------
+# A release run reads its offline tree from <root>/<version>/offline-files/, not
+# from deployments/offline-files/, so the dev volume floor below cannot be its
+# completeness gate. The marker release-publish.sh writes last is.
+REL="$(cs_run_env_get CUBESTACK_RELEASE)"
+REL_ROOT="$(cs_run_env_get CUBESTACK_RELEASE_ROOT)"
+REL_ROOT="${REL_ROOT:-/opt/cubestack-installer/offline-releases}"
+if [ -n "$REL" ]; then
+  case "$REL" in
+    [0-9A-Za-z]*) ;;
+    *) cs_fail E_DEPLOY_PRECOND_FETCH "release=$REL" recover="rerun:preflight" \
+         hint="run.env carries a malformed CUBESTACK_RELEASE; re-run preflight" ;;
+  esac
+  case "$REL" in
+    *[!0-9A-Za-z._-]*) cs_fail E_DEPLOY_PRECOND_FETCH "release=$REL" recover="rerun:preflight" \
+         hint="run.env carries a malformed CUBESTACK_RELEASE; re-run preflight" ;;
+  esac
+  case "$REL_ROOT" in
+    /*) ;;
+    *) cs_fail E_DEPLOY_PRECOND_FETCH "release_root=$REL_ROOT" recover="rerun:preflight" \
+         hint="run.env carries a non-absolute CUBESTACK_RELEASE_ROOT; re-run preflight" ;;
+  esac
+  case "$REL_ROOT" in
+    *[[:space:]]*|*"'"*|*'"'*) cs_fail E_DEPLOY_PRECOND_FETCH "release_root=$REL_ROOT" recover="rerun:preflight" \
+         hint="run.env carries a CUBESTACK_RELEASE_ROOT with whitespace or quotes; re-run preflight" ;;
+  esac
+fi
+
 # One exec, all four probes: a 1-second precise verdict instead of a 12-minute
 # death at local_path.
 PRE="$(cs_pod_exec "$CS_POD" bash -c '
@@ -129,7 +156,16 @@ if [ "$CONF_REDACTED" != "0" ]; then
     recover="fix-values:cluster.conf:SSH_DEFAULT_PASSWORD,MINIO_SECRET_KEY" \
     hint="cluster.conf contains *** (tool-layer redaction); rewrite it through the values file and re-verify the bytes"
 fi
-if [ "$FETCH_MB" -lt "$CS_FETCH_FLOOR_MB" ]; then
+if [ -n "$REL" ]; then
+  REL_STATE="$(cs_pod_exec "$CS_POD" bash -c "
+    R='$REL_ROOT/$REL'
+    if [ -f \"\$R/offline-files/_SUCCESS\" ]; then echo 1; else echo 0; fi" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$REL_STATE" ] || REL_STATE=0
+  if [ "$REL_STATE" != "1" ]; then
+    cs_fail E_DEPLOY_PRECOND_FETCH "pod=$CS_POD" "release=$REL" recover=rerun:fetch-offline \
+      hint="the $REL release tree is missing or incomplete in the pod; run fetch-offline (it reads CUBESTACK_RELEASE and fetches $REL_ROOT/$REL)"
+  fi
+elif [ "$FETCH_MB" -lt "$CS_FETCH_FLOOR_MB" ]; then
   cs_fail E_DEPLOY_PRECOND_FETCH "pod=$CS_POD" "fetch_mb=$FETCH_MB" recover=rerun:fetch-offline \
     hint="offline files are below the ~15GiB floor; the deploy would die at local_path - run the offline fetch first"
 fi
@@ -265,4 +301,5 @@ printf '%s\n' "$NODESET" > "$NODESET_FILE" 2>/dev/null || true
 [ -n "$DRIFT" ] && cs_note "$DRIFT"
 cs_note "deploy launched (pid=$PID fresh=$FRESH); watch it with deploy-wait"
 
-cs_ok "pid=$PID" "fresh=$FRESH" "skip=${SKIP:-none}" "log=$CS_DEPLOY_LOG"
+cs_ok "pid=$PID" "fresh=$FRESH" "skip=${SKIP:-none}" "log=$CS_DEPLOY_LOG" \
+      "release=$([ -n "$REL" ] && echo "$REL" || echo dev)"

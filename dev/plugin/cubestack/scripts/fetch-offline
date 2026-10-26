@@ -23,6 +23,11 @@
 # Idempotent and resumable: `du` on offline-files/ is the only evidence a prior
 # fetch completed, so a re-run that already has the bytes skips the download
 # instead of trusting that "a previous run said done".
+#
+# Release mode: when preflight recorded CUBESTACK_RELEASE, this fetches that
+# versioned tree (<release-root>/<version>/offline-files/) instead of the dev
+# tree. The size floor does not apply there; completeness is _SUCCESS plus a
+# matching release.env and the version's CLI tar.
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/verdict.sh
@@ -46,7 +51,9 @@ fetch-offline --values <file> [--pod NAME] [--run ID] [--floor MIB]
   --values FILE  local values file carrying MINIO_EP / MINIO_AK / MINIO_SK
   --run ID       the run this fetch belongs to (default: this run's id)
   --pod NAME     installer pod (default: this run's, <prefix>-<run-id>)
-  --floor MIB    consider the fetch complete above this size (default 15000)
+  --floor MIB    consider the fetch complete above this size (default 15000).
+                 Dev channel only: a release tree is graded on _SUCCESS, its
+                 release.env version and the CLI tar instead.
 USAGE
 }
 
@@ -69,6 +76,50 @@ cs_values_lint "$VALUES" MINIO_EP MINIO_AK MINIO_SK
 # change - and would refuse the `fix-values:` re-invocation the lint prescribes.
 cs_budget_guard
 cs_pod_require "$POD_ARG"
+
+# The release is decided once, by preflight, and recorded in run.env. Reading it
+# here (rather than taking a flag) is what keeps Step 4's configure and this step
+# independent: both consume the same recorded answer and can run in parallel.
+REL="$(cs_run_env_get CUBESTACK_RELEASE)"
+REL_ROOT="$(cs_run_env_get CUBESTACK_RELEASE_ROOT)"
+REL_ROOT="${REL_ROOT:-/opt/cubestack-installer/offline-releases}"
+if [ -n "$REL" ]; then
+  case "$REL" in
+    [0-9A-Za-z]*) ;;
+    *) cs_fail E_FETCH_RELEASE "release=$REL" recover="rerun:preflight" \
+         hint="run.env carries a malformed CUBESTACK_RELEASE; re-run preflight with a valid --release" ;;
+  esac
+  case "$REL" in
+    *[!0-9A-Za-z._-]*) cs_fail E_FETCH_RELEASE "release=$REL" recover="rerun:preflight" \
+         hint="run.env carries a malformed CUBESTACK_RELEASE; re-run preflight with a valid --release" ;;
+  esac
+  case "$REL_ROOT" in
+    /*) ;;
+    *) cs_fail E_FETCH_RELEASE "release_root=$REL_ROOT" recover="rerun:preflight" \
+         hint="run.env carries a non-absolute CUBESTACK_RELEASE_ROOT; re-run preflight" ;;
+  esac
+  case "$REL_ROOT" in
+    *[[:space:]]*|*"'"*|*'"'*) cs_fail E_FETCH_RELEASE "release_root=$REL_ROOT" recover="rerun:preflight" \
+         hint="run.env carries a CUBESTACK_RELEASE_ROOT with whitespace or quotes; re-run preflight" ;;
+  esac
+fi
+
+# Complete means the marker release-publish.sh writes last, a release.env that
+# names this version, and the CLI tar. The tar is versioned in the current
+# layout (cubestack-installer-cli-v<version>.tar); the unversioned name is the
+# old layout and is still accepted as a fallback.
+release_state() {
+  cs_pod_exec "$CS_POD" bash -c "
+    R='$REL_ROOT/$REL'
+    if [ ! -f \"\$R/offline-files/_SUCCESS\" ]; then echo missing_success; exit 0; fi
+    if [ ! -f \"\$R/offline-files/release.env\" ]; then echo missing_release_env; exit 0; fi
+    v=\$(sed -n 's/^RELEASE_VERSION=//p' \"\$R/offline-files/release.env\" | tr -d '\"' | head -1)
+    if [ \"\$v\" != '$REL' ]; then echo \"version_mismatch:\$v\"; exit 0; fi
+    name='cubestack-installer-cli-v${REL#v}.tar'
+    if [ ! -f \"\$R/\$name\" ] && [ -f \"\$R/cubestack-installer-cli.tar\" ]; then name='cubestack-installer-cli.tar'; fi
+    if [ ! -f \"\$R/\$name\" ]; then echo \"missing_cli_tar:\$name\"; exit 0; fi
+    echo complete" 2>/dev/null | tr -d '[:space:]'
+}
 
 # Script-scoped, NOT the bare /tmp/cubestack-values.conf: the skill documents
 # Steps 4 and 5 as parallel, and configure copies its own values file into the
@@ -125,17 +176,31 @@ size_mib() {
     "du -sm $REPO/deployments/offline-files/ 2>/dev/null | cut -f1" 2>/dev/null | tr -d '[:space:]'
 }
 
-before="$(size_mib)"
-cs_kv_nonnumeric "$before" && before=0
-if [ "$before" -ge "$FLOOR_MIB" ]; then
-  cs_note "offline files already present (${before} MiB) — skipping the fetch"
-  cs_ok "size=${before}MiB" "skipped=1" "pod=$CS_POD"
+if [ -n "$REL" ]; then
+  rel_state="$(release_state)"
+  if [ "$rel_state" = "complete" ]; then
+    cs_note "release $REL already present under $REL_ROOT — skipping the fetch"
+    cs_ok "release=$REL" "skipped=1" "pod=$CS_POD"
+  fi
+else
+  before="$(size_mib)"
+  cs_kv_nonnumeric "$before" && before=0
+  if [ "$before" -ge "$FLOOR_MIB" ]; then
+    cs_note "offline files already present (${before} MiB) — skipping the fetch"
+    cs_ok "size=${before}MiB" "skipped=1" "pod=$CS_POD"
+  fi
 fi
 
 # --- fetch ------------------------------------------------------------------
-cs_note "fetching offline packages (${before} MiB present) — ~154 GiB / ~9 min on the dev network"
-fetch_out="$(cs_pod_exec "$CS_POD" bash -c \
-  "cd $REPO && ./deployments/scripts/tools/offline/fetch-offline-from-minio.sh --yes 2>&1")"
+if [ -n "$REL" ]; then
+  cs_note "fetching release $REL into $REL_ROOT (versioned tree)"
+  fetch_out="$(cs_pod_exec "$CS_POD" bash -c \
+    "cd $REPO && ./deployments/scripts/tools/offline/fetch-offline-from-minio.sh --release '$REL' --dest '$REL_ROOT' --yes 2>&1")"
+else
+  cs_note "fetching offline packages (${before} MiB present) — ~154 GiB / ~9 min on the dev network"
+  fetch_out="$(cs_pod_exec "$CS_POD" bash -c \
+    "cd $REPO && ./deployments/scripts/tools/offline/fetch-offline-from-minio.sh --yes 2>&1")"
+fi
 rc=$?
 
 if [ "$rc" -ne 0 ]; then
@@ -154,12 +219,52 @@ if [ "$rc" -ne 0 ]; then
   esac
 fi
 
-after="$(size_mib)"
-cs_kv_nonnumeric "$after" && after=0
-if [ "$after" -lt "$FLOOR_MIB" ]; then
-  cs_fail E_FETCH_PARTIAL "size=${after}MiB" "floor=${FLOOR_MIB}MiB" \
-    recover="rerun:fetch-offline" \
-    hint="fetch exited 0 but only ${after} MiB landed; the fetch is resumable, re-run it"
-fi
+if [ -n "$REL" ]; then
+  # The pod-side fetch has been seen to land one level too deep
+  # (<version>/offline-files/offline-files/...). Flatten it before grading, so a
+  # complete tree is not reported partial by its own layout. Entries are merged
+  # (an existing directory of the same name is populated, not refused), and
+  # _SUCCESS moves last: an interrupted flatten then leaves the tree visibly
+  # incomplete and the next run retries instead of trusting a partial parent.
+  parent="$REL_ROOT/$REL/offline-files"
+  nested="$parent/offline-files"
+  if cs_pod_exec "$CS_POD" bash -c \
+       "[ -f '$nested/_SUCCESS' ] && [ ! -f '$parent/_SUCCESS' ]" >/dev/null 2>&1; then
+    cs_note "release tree landed one level too deep; flattening $REL/offline-files/offline-files"
+    cs_pod_exec "$CS_POD" bash -c "
+      set -e
+      shopt -s dotglob nullglob
+      for e in '$nested'/*; do
+        b=\$(basename \"\$e\")
+        [ \"\$b\" = _SUCCESS ] && continue
+        if [ -d \"\$e\" ] && [ -d '$parent'/\$b ]; then
+          cp -a \"\$e\"/. '$parent'/\$b/
+          rm -rf \"\$e\"
+        else
+          mv \"\$e\" '$parent'/
+        fi
+      done
+      mv '$nested/_SUCCESS' '$parent/_SUCCESS'
+      rmdir '$nested'
+    " >/dev/null 2>&1 \
+      || cs_fail E_FETCH_PARTIAL "release=$REL" "layout=nested" recover="rerun:fetch-offline" \
+           hint="the release tree is nested (offline-files/offline-files) and could not be flattened"
+  fi
+  rel_state="$(release_state)"
+  if [ "$rel_state" != "complete" ]; then
+    cs_fail E_FETCH_PARTIAL "release=$REL" "state=$rel_state" \
+      recover="rerun:fetch-offline" \
+      hint="fetch exited 0 but the release tree is incomplete ($rel_state); the fetch is resumable, re-run it"
+  fi
+  cs_ok "release=$REL" "skipped=0" "tree=$REL_ROOT/$REL" "pod=$CS_POD"
+else
+  after="$(size_mib)"
+  cs_kv_nonnumeric "$after" && after=0
+  if [ "$after" -lt "$FLOOR_MIB" ]; then
+    cs_fail E_FETCH_PARTIAL "size=${after}MiB" "floor=${FLOOR_MIB}MiB" \
+      recover="rerun:fetch-offline" \
+      hint="fetch exited 0 but only ${after} MiB landed; the fetch is resumable, re-run it"
+  fi
 
-cs_ok "size=${after}MiB" "skipped=0" "pod=$CS_POD"
+  cs_ok "size=${after}MiB" "skipped=0" "pod=$CS_POD"
+fi

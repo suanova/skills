@@ -188,13 +188,14 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 4 | VM owner label | `owner=$USER` |
 | 5 | SSH password | `ubuntu` |
 | 6 | MinIO endpoint + keys | **built-in** — the Cluster facts row above; never ask |
-| 7 | Service expose mode | **`metallb`** (LoadBalancer) — MetalLB is a **required** component and this is the default. The pool is **not chosen here**: **Step 1b** reserves a contiguous block of addresses from the host's cubestack-ipam (`--count`, default 2; use `1` when the registry is off) and hands that block to the installer, so every address MetalLB can reach is already bound to this box in the ledger. Nothing is patched after the deploy. `--expose nodeport` is an explicit opt-out, and it also releases the `verify` gate |
+| 7 | Service expose mode | **`metallb`** (LoadBalancer) — MetalLB is a **required** component and this is the default. The pool is **not chosen here**: **Step 1b** reserves a contiguous block of addresses from the host's cubestack-ipam (`--count`, default 4: the envoy gateway, grafana and cuberouter always take three, and a registry exposed through `LoadBalancer` takes the fourth — spare when the registry is NodePort or off) and hands that block to the installer, so every address MetalLB can reach is already bound to this box in the ledger. Nothing is patched after the deploy. `--expose nodeport` is an explicit opt-out, and it also releases the `verify` gate |
 | 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>` |
 | 9 | External Ceph | **required** — ask for the Provider's exported `external-ceph.env` path (`--external-ceph-env`). Not an optional storage extra: on the minimal profile it is what the registry's PVC binds to (see *Minimal profile*), so a run without it is not this profile |
 | 10 | Model store on the nodes | off unless the user asks for it — then ask for the Provider's CephFS Linux-host mount guide path (`--cephfs-mount-guide`). Independent of #9: a run can import external Ceph without wanting `/models` on the hosts, and a guide alone does not import anything |
 | 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen components** (all but `exporters.bmc`, which needs an admin-created Secret — see Step 7), *or adopts the platform the deploy already installed if it installed one* (see Step 7). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
 | 12 | Harbor read-only robot credential | **required while #11 is on** — a file with `HARBOR_RO_USER` / `HARBOR_RO_PW`, passed as `--harbor-ro-values`. Author it with `Write` **before running `preflight`**, like the two Provider files above, so `preflight` can lint it while the user is still in the room |
 | 13 | Operator image source | **`online`** — the operator and every component image come from `harbor.isuanova.com`, pulled by the **nodes**, which is what makes #12 load-bearing. Not the switch for whether a platform is installed (that is #11, and it is on); only where its images come from. `--operator-images offline` opts out and takes the installer's own default — an offline tar pushed into the box's in-cluster registry, needing neither the credential nor a node→Harbor path. **Step 3 checks** the path this needs — see *The operator's images* under the values file |
+| 14 | Offline release version | **none — the rolling dev channel** (`deployments/offline-files/`). `--release <version>` installs a published tree instead: `<release-root>/<version>/offline-files/`, defaulting the root to the installer's own `/opt/cubestack-installer/offline-releases`. The flag drives Steps 4–7 together — `configure` writes it into `cluster.conf`, `fetch-offline` fetches that tree, and `operator-up` takes its chart from it. `--release-root` is only for a tree outside the default root |
 
 Then resolve everything with one read-only call and confirm the printed plan:
 
@@ -208,6 +209,13 @@ Pass `--minio-ep` from the Cluster facts table **every time**. It is not optiona
 practice: `preflight` records it as `MINIO_EP` in `run.env`, and Step 3's `env-probe`
 reads that key. Omit it and `env-probe` fails `E_USAGE` with
 `--minio-ip is required (not set on the command line or in run.env)`.
+
+To install a published release, add `--release <version>` (for example `2.0.0-rc2`);
+`--release-root` is needed only when the tree is not under the installer's default
+`/opt/cubestack-installer/offline-releases`. The one flag then carries through the rest
+of the run: Step 4 writes `CUBESTACK_RELEASE` into `cluster.conf`, Step 5 fetches
+`<root>/<version>/offline-files/`, and `operator-up` reads the chart from that tree.
+Omit it to keep the rolling dev channel.
 
 `--harbor-ro-values` is **not** optional unless `--no-operator` is also given: the file
 *is* the switch that turns Step 7 on, so omitting it from a cubestack-box run is `E_USAGE`
@@ -577,10 +585,10 @@ and has no opinion on which mode you meant.
 
 The three are coupled, and the coupling is the installer's:
 
-- **`--count 2` at Step 1b.** With MetalLB on *and* the registry on there are two consumers of the
-  reserved block — the registry takes its low address, the gateway's data plane the high one. That
-  is Step 1b's default, so the profile needs no flag; a box with the registry off reserves
-  `--count 1` instead, which is why the flag exists.
+- **`--count 4` at Step 1b.** With MetalLB on there are three LoadBalancer consumers — the envoy
+  gateway, grafana and cuberouter — and a registry exposed through LoadBalancer is a fourth. That
+  is Step 1b's default; with the registry on NodePort or off the fourth address is spare, which is
+  the safe side of an immutable count.
 - **External Ceph is where the registry lives.** Its PVC binds to `local-path` unless Ceph is on
   (*The registry and its storage backend* above), and requiring Ceph is what turns local-path off.
   So on this profile the import is not a storage extra bolted on beside the registry — it is the
@@ -826,8 +834,9 @@ id; a `preflight` re-run also resets it.
 and records the range as `POOL_RANGE`. `configure` feeds that to the installer as `METALLB_POOL`.
 That is the whole flow — one step, before the box exists, and nothing touches MetalLB or any
 Service after the deploy finishes. The block is **as many addresses as the box has LoadBalancer
-consumers** (`--count`, default 2): two for a box with the registry on, one for a box with
-`REGISTRY_ENABLED='false'`, where the gateway is the only consumer.
+consumers** (`--count`, default 4): the envoy gateway, grafana and cuberouter always take three;
+a registry exposed through LoadBalancer takes the fourth, which is spare when the registry is
+NodePort or off.
 
 1. **One `IPRangeRequest`, not a claim per address.** `poolRef` + `count`, which is the whole spec.
    It carries an `ownerReferences` entry pointing at the box's **master node's `VirtualMachine`**
@@ -1176,11 +1185,14 @@ It reserves a **contiguous block** of addresses from the host's cubestack-ipam a
 that block to the installer as `METALLB_POOL`. See **VIPs come from the host's IPAM** above for why
 the addresses are reserved rather than chosen, and what the request is.
 
-**How many addresses is `--count`, and it is a property of the run.** The default is 2: that is the
-shape of a box with the in-cluster registry **on**, where the registry takes the block's low address
-and the gateway's data plane takes the high one. A box with `REGISTRY_ENABLED='false'` has no
-registry, so its only consumer is the gateway and reserving two would strand an address for the life
-of the box — pass `--count 1`.
+**How many addresses is `--count`, and it is a property of the run.** The default is 4: the shipped
+profile exposes the envoy gateway, grafana and cuberouter through `LoadBalancer` (three), and a
+registry exposed through `LoadBalancer` is the fourth. With the registry on NodePort (the normal
+shape) or with `REGISTRY_ENABLED='false'`, the fourth address is spare — over-reserving by one is
+cheaper than an immutable count that leaves a Service pending.
+
+> A pending Service in `verify`'s `vip_pending=` means the reserved block was too small. `spec.count`
+> is immutable, so fix it **before** the deploy: `--release`, then re-run with the larger count.
 
 > **It cannot be derived here.** `configure` sets `run.env`'s `REGISTRY_REQUESTED` from the values
 > file, but it runs at Step 4 and this runs at Step 1b, so the count has to be passed in. Read it off
@@ -1235,6 +1247,12 @@ so a re-run whose request has gone missing *and* whose run has already deployed 
 ```bash
 "$S/pod-up" --run <run-id>          # --subnet defaults to run.env SUBNET
 ```
+
+> **A release run needs the release's own CLI image.** `pod-up` defaults to the rolling
+> `cubestack-installer-cli:latest`, but a release tree pins the matching image in its
+> `release.env` (`CUBESTACK_CLI_IMAGE`). Pass it as `--image <that ref>`: the pod's
+> `fetch-offline-from-minio.sh` is what reads the tree, and only the release's image is
+> guaranteed to know the tree's current layout (the versioned CLI tar).
 
 > **Omit `--subnet` once `preflight` has run.** `run.env` already holds it, and passing the
 > wrong value is costly rather than merely wrong. The value is the **label** preflight
@@ -1338,6 +1356,12 @@ author nor edit it.
 > the rewriter the two `CUBESTACK_OPERATOR_HARBOR_USER`/`_PASSWORD` keys; the pod-side copy is
 > shredded on every exit path, the same as the values file. The verdict reports `images=online|offline`.
 
+> **`CUBESTACK_RELEASE` follows the same rule.** When Step 0 was given `--release`, `configure`
+> injects that version into `cluster.conf` from `run.env`; a `CUBESTACK_RELEASE` in the values file
+> is not honoured, so `fetch-offline`, `configure` and `operator-up` cannot end up on different
+> trees. Without a release the key is absent and `cluster.defaults.conf` keeps the dev path.
+> The verdict reports `release=<version>` or `release=dev`.
+
 When Step 0 was given `--external-ceph-env`, `configure` also places that file — it reads the
 path from the run dir, so **you do not pass it again** — and hash-verifies the copy. It is left
 in place deliberately: the installer sources it mid-deploy. `pod-down` removes it.
@@ -1371,6 +1395,20 @@ Seeds `deployments/config/minio.conf` (which is what the fetch actually reads �
 `cluster.conf`) via a repo helper, byte-gates it, then fetches the offline tree. Idempotent: `du`
 on `offline-files/` is the only evidence a prior fetch completed, so a re-run above the floor
 returns `skipped=1`. A partial tree is `E_FETCH_PARTIAL`, never silently accepted.
+
+> **A release run fetches a versioned tree instead.** When Step 0 recorded `CUBESTACK_RELEASE`,
+> `fetch-offline` calls `fetch-offline-from-minio.sh --release <version> --dest <root>`, and the
+> tree lands at `<root>/<version>/offline-files/` with the CLI tar beside it
+> (`cubestack-installer-cli-v<version>.tar`; the older unversioned
+> `cubestack-installer-cli.tar` is still accepted). Completeness is `_SUCCESS` plus a
+> `release.env` naming the version plus that tar — the dev `--floor` and the 15 GiB discussion
+> below do **not** apply. A tree that is already complete returns `skipped=1`; an incomplete one
+> is `E_FETCH_PARTIAL`. Both the dev and release paths read the version from `run.env`, so Step 4
+> and Step 5 stay independent and can run in parallel.
+>
+> The 2.0.0 tree is roughly 118 GiB; run this step as a **background task** — it can outlast the
+> foreground command ceiling. If the pod's fetch lands the tree one level too deep
+> (`offline-files/offline-files/`), this step flattens it before grading.
 
 **The floor is the operative number, not any GiB figure in this document.** `deploy` refuses to
 launch below **15360 MiB** (`CS_FETCH_FLOOR_MB`); the fetch script carries its own `--floor`
@@ -1548,10 +1586,14 @@ chart would leave the old binary running and the same Degraded state behind it.
 
 What the pair does, in order, and why the order is not negotiable:
 
-- **`operator-up` uses the offline bundle's chart by default on offline runs**
-  (`OPERATOR_IMAGES=offline`), at
-  `/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts/<chart>-<version>.tgz`
-  (`fetch-offline` pulls it). It installs that local copy and skips the Harbor
+- **`operator-up` uses the active offline tree's chart by default on offline runs**
+  (`OPERATOR_IMAGES=offline`). On a dev run that is
+  `/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts/<chart>-<version>.tgz`;
+  when the run has `CUBESTACK_RELEASE` it is
+  `${CUBESTACK_RELEASE_ROOT:-/opt/cubestack-installer/offline-releases}/<version>/offline-files/cubestack-operator/charts/<chart>-<version>.tgz`.
+  The chart version in that case comes from the tree's `release.env`
+  (`CUBESTACK_OPERATOR_CHART_VERSION`); `operator-up` reads it unless `--version` is given.
+  `fetch-offline` pulls whichever tree the run selected. It installs that local copy and skips the Harbor
   registry login. An explicit local `--chart` also skips chart login; an explicit
   OCI `--chart` uses that reference and logs in to Harbor. Online runs keep pulling
   `oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart`,

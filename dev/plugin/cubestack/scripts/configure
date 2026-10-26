@@ -252,6 +252,39 @@ else
   INJECT="$INJECT ONLINE_DEPLOY_CUBESTACK_OPERATOR='false'"
 fi
 
+# The release version is the same shape of run-level decision as the image mode:
+# preflight resolves it once, this step writes it into cluster.conf, and
+# fetch-offline/operator-up read it back from run.env. A values-file
+# CUBESTACK_RELEASE is deliberately not honoured — three consumers writing one
+# key from three sources is how fetch and configure end up on different trees.
+RELEASE="$(cs_run_env_get CUBESTACK_RELEASE)"
+RELEASE_ROOT="$(cs_run_env_get CUBESTACK_RELEASE_ROOT)"
+if [ -n "$RELEASE" ]; then
+  case "$RELEASE" in
+    [0-9A-Za-z]*) ;;
+    *) cs_fail E_CONF_FIELD_MISSING "release=$RELEASE" recover="rerun:preflight" \
+         hint="run.env carries a malformed CUBESTACK_RELEASE; re-run preflight with a valid --release" ;;
+  esac
+  case "$RELEASE" in
+    *[!0-9A-Za-z._-]*) cs_fail E_CONF_FIELD_MISSING "release=$RELEASE" recover="rerun:preflight" \
+         hint="run.env carries a malformed CUBESTACK_RELEASE; re-run preflight with a valid --release" ;;
+  esac
+  # The root is recorded beside the version, resolved to its effective value, so
+  # the deploy reads the same tree fetch-offline filled even if the installer's
+  # default moves. cluster.defaults.conf declares both keys.
+  RELEASE_ROOT="${RELEASE_ROOT:-/opt/cubestack-installer/offline-releases}"
+  case "$RELEASE_ROOT" in
+    /*) ;;
+    *) cs_fail E_CONF_FIELD_MISSING "release_root=$RELEASE_ROOT" recover="rerun:preflight" \
+         hint="run.env carries a non-absolute CUBESTACK_RELEASE_ROOT; re-run preflight" ;;
+  esac
+  case "$RELEASE_ROOT" in
+    *[[:space:]]*|*"'"*|*'"'*) cs_fail E_CONF_FIELD_MISSING "release_root=$RELEASE_ROOT" recover="rerun:preflight" \
+         hint="run.env carries a CUBESTACK_RELEASE_ROOT with whitespace or quotes; re-run preflight" ;;
+  esac
+  INJECT="$INJECT CUBESTACK_RELEASE='$RELEASE' CUBESTACK_RELEASE_ROOT='$RELEASE_ROOT'"
+fi
+
 # The credential the online mode cannot run without, and the last gate before a
 # deploy that would otherwise look successful. The installer's operator module
 # does not fail on a missing credential: it warns and clears the CR's
@@ -318,7 +351,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
     cs_note "  operator   images from the offline tar via the in-cluster registry"
   fi
   cs_ok "dry_run=1" "conf=$CONF_NAME" "conf_state=$CONF_STATE" "pod=$CS_POD" \
-        "ext_env=$EXT_ENV_FLAG" "dns=$UPSTREAM_DNS_SRC" "images=$OPERATOR_IMAGES"
+        "ext_env=$EXT_ENV_FLAG" "dns=$UPSTREAM_DNS_SRC" "images=$OPERATOR_IMAGES" \
+        "release=$([ -n "$RELEASE" ] && echo "$RELEASE" || echo dev)"
 fi
 
 # Regenerate in place; seed from the example ONLY when absent. Re-copying the
@@ -605,6 +639,9 @@ if [ "$OPERATOR_IMAGES" = online ]; then
 else
   cs_note "operator images: offline — from the offline tar via the in-cluster registry"
 fi
+if [ -n "$RELEASE" ]; then
+  cs_note "release: $RELEASE — cluster.conf points the deploy at $RELEASE_ROOT/$RELEASE/offline-files"
+fi
 [ "$EXT_ENV_FLAG" = 1 ] && cs_note "external Ceph: official import path ($CEPH_ENV_DEST hash-verified, left in place for the deploy)"
 if [ "$UPSTREAM_DNS_SRC" = default ]; then
   # Scoped to "first configure" on purpose: an injection is what puts a value IN
@@ -620,4 +657,4 @@ fi
 cs_ok "conf=$CONF_NAME" "pod=$CS_POD" "applied=$(printf '%s' "$applied" | tr ' ' ',')" \
       "ext_env=$EXT_ENV_FLAG" "cephfs=$CEPHFS_REQ" "registry=$REGISTRY_REQ" \
       "metallb=$METALLB_REQ" "gpu=$GPU_REQ" "rdma=$RDMA_REQ" "dns=$UPSTREAM_DNS_SRC" \
-      "images=$OPERATOR_IMAGES"
+      "images=$OPERATOR_IMAGES" "release=$([ -n "$RELEASE" ] && echo "$RELEASE" || echo dev)"
