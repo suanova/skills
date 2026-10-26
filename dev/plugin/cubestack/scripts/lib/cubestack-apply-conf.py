@@ -369,8 +369,10 @@ def main():
     #
     # The CEPHFS_* keys below are the one place the EOF-append fallback is still
     # correct: those exist ONLY inside the example's commented block.
+    # K8S_ENABLED is deliberately absent: the installer removed it on 2026-10-16
+    # (it now always installs the k8s base), and a values file written for an
+    # older image still carrying it must not fail a run that cannot change it.
     for key in (
-        "K8S_ENABLED",
         "KUBE_VIP_ENABLED",
         "LWS_ENABLED",
         "NETSHOOT_ENABLED",

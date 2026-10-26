@@ -1190,6 +1190,12 @@ and the gateway's data plane takes the high one. A box with `REGISTRY_ENABLED='f
 registry, so its only consumer is the gateway and reserving two would strand an address for the life
 of the box — pass `--count 1`.
 
+> **Count every LoadBalancer consumer, not just the registry and gateway.** The shipped profile also
+> exposes grafana and cuberouter through `LoadBalancer`; with the registry on **NodePort** that is
+> **3** consumers (gateway, grafana, cuberouter). A pending Service in `verify`'s `vip_pending=` means
+> the reserved block was too small. `spec.count` is immutable, so fix it **before** the deploy:
+> `--release`, then re-run with the larger count.
+
 > **It cannot be derived here.** `configure` sets `run.env`'s `REGISTRY_REQUESTED` from the values
 > file, but it runs at Step 4 and this runs at Step 1b, so the count has to be passed in. Read it off
 > the values file you are about to hand `configure`.
@@ -1401,6 +1407,10 @@ returns `skipped=1`. A partial tree is `E_FETCH_PARTIAL`, never silently accepte
 > below do **not** apply. A tree that is already complete returns `skipped=1`; an incomplete one
 > is `E_FETCH_PARTIAL`. Both the dev and release paths read the version from `run.env`, so Step 4
 > and Step 5 stay independent and can run in parallel.
+>
+> The 2.0.0 tree is roughly 118 GiB; run this step as a **background task** — it can outlast the
+> foreground command ceiling. If the pod's fetch lands the tree one level too deep
+> (`offline-files/offline-files/`), this step flattens it before grading.
 
 **The floor is the operative number, not any GiB figure in this document.** `deploy` refuses to
 launch below **15360 MiB** (`CS_FETCH_FLOOR_MB`); the fetch script carries its own `--floor`

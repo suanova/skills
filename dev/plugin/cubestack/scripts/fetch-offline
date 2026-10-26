@@ -220,6 +220,18 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 if [ -n "$REL" ]; then
+  # The pod-side fetch has been seen to land one level too deep
+  # (<version>/offline-files/offline-files/...). Flatten it before grading, so a
+  # complete tree is not reported partial by its own layout.
+  nested="$REL_ROOT/$REL/offline-files/offline-files"
+  if cs_pod_exec "$CS_POD" bash -c \
+       "[ -f '$nested/_SUCCESS' ] && [ ! -f '$REL_ROOT/$REL/offline-files/_SUCCESS' ]" >/dev/null 2>&1; then
+    cs_note "release tree landed one level too deep; flattening $REL/offline-files/offline-files"
+    cs_pod_exec "$CS_POD" bash -c \
+      "shopt -s dotglob; mv '$nested'/* '$REL_ROOT/$REL/offline-files/' && rmdir '$nested'" >/dev/null 2>&1 \
+      || cs_fail E_FETCH_PARTIAL "release=$REL" "layout=nested" recover="rerun:fetch-offline" \
+           hint="the release tree is nested (offline-files/offline-files) and could not be flattened"
+  fi
   rel_state="$(release_state)"
   if [ "$rel_state" != "complete" ]; then
     cs_fail E_FETCH_PARTIAL "release=$REL" "state=$rel_state" \
