@@ -183,6 +183,10 @@ VALUES=""
 POD_ARG=""
 CHART=""
 VERSION="$CS_CHART_VERSION"
+# Whether the caller named a version. A release run otherwise takes the tree's
+# CUBESTACK_OPERATOR_CHART_VERSION, but an explicit --version — including an
+# explicit 1.0.0-latest — must win.
+VERSION_EXPLICIT=0
 RELEASE="$CS_RELEASE"
 OP_NS="$CS_OPERATOR_NS"
 PULL_SECRET="$CS_PULL_SECRET"
@@ -195,7 +199,7 @@ while [ $# -gt 0 ]; do
     --run) cs_need_val "$@";         cs_run_opt "${2:-}"; shift 2 ;;
     --pod) cs_need_val "$@";         POD_ARG="${2:-}"; shift 2 ;;
     --chart) cs_need_val "$@";       CHART="${2:-}"; shift 2 ;;
-    --version) cs_need_val "$@";     VERSION="${2:-}"; shift 2 ;;
+    --version) cs_need_val "$@";     VERSION="${2:-}"; VERSION_EXPLICIT=1; shift 2 ;;
     --release) cs_need_val "$@";     RELEASE="${2:-}"; shift 2 ;;
     --namespace) cs_need_val "$@";   OP_NS="${2:-}"; shift 2 ;;
     --pull-secret) cs_need_val "$@"; PULL_SECRET="${2:-}"; shift 2 ;;
@@ -233,6 +237,10 @@ case "$CUBESTACK_RELEASE_ROOT" in *[[:space:]]*|*"'"*|*'"'*)
   cs_usage_fail "run.env carries a CUBESTACK_RELEASE_ROOT with whitespace or quotes (re-run preflight)" ;;
 esac
 if [ -n "$CUBESTACK_RELEASE" ]; then
+  case "$CUBESTACK_RELEASE_ROOT" in
+    /*) ;;
+    *) cs_usage_fail "run.env carries a non-absolute CUBESTACK_RELEASE_ROOT (re-run preflight)" ;;
+  esac
   CS_CHART_BUNDLE_DIR="${CUBESTACK_RELEASE_ROOT}/${CUBESTACK_RELEASE}/offline-files/cubestack-operator/charts"
 else
   CS_CHART_BUNDLE_DIR="/opt/cubestack-installer/deployments/offline-files/cubestack-operator/charts"
@@ -353,7 +361,7 @@ cs_pod_require "$POD_ARG"
 # A release run's chart version lives in the release tree, not in this script's
 # rolling default. Read it from the pod's release.env unless --version was given
 # explicitly (an explicit flag is still authoritative).
-if [ -n "$CUBESTACK_RELEASE" ] && [ "$VERSION" = "$CS_CHART_VERSION" ]; then
+if [ -n "$CUBESTACK_RELEASE" ] && [ "$VERSION_EXPLICIT" = "0" ]; then
   rel_chart_ver="$(cs_pod_exec "$CS_POD" bash -c \
     "sed -n 's/^CUBESTACK_OPERATOR_CHART_VERSION=//p' '$CUBESTACK_RELEASE_ROOT/$CUBESTACK_RELEASE/offline-files/release.env' 2>/dev/null | tr -d '\"' | head -1")"
   case "$rel_chart_ver" in

@@ -1184,17 +1184,13 @@ It reserves a **contiguous block** of addresses from the host's cubestack-ipam a
 that block to the installer as `METALLB_POOL`. See **VIPs come from the host's IPAM** above for why
 the addresses are reserved rather than chosen, and what the request is.
 
-**How many addresses is `--count`, and it is a property of the run.** The default is 2: that is the
-shape of a box with the in-cluster registry **on**, where the registry takes the block's low address
-and the gateway's data plane takes the high one. A box with `REGISTRY_ENABLED='false'` has no
-registry, so its only consumer is the gateway and reserving two would strand an address for the life
-of the box — pass `--count 1`.
+**How many addresses is `--count`, and it is a property of the run.** The default is 3: the shipped
+profile exposes the envoy gateway, grafana and cuberouter through `LoadBalancer`. A registry exposed
+through `LoadBalancer` is a fourth consumer; with the registry on NodePort (the normal shape) or with
+`REGISTRY_ENABLED='false'`, the count is still **3**, because the other three remain.
 
-> **Count every LoadBalancer consumer, not just the registry and gateway.** The shipped profile also
-> exposes grafana and cuberouter through `LoadBalancer`; with the registry on **NodePort** that is
-> **3** consumers (gateway, grafana, cuberouter). A pending Service in `verify`'s `vip_pending=` means
-> the reserved block was too small. `spec.count` is immutable, so fix it **before** the deploy:
-> `--release`, then re-run with the larger count.
+> A pending Service in `verify`'s `vip_pending=` means the reserved block was too small. `spec.count`
+> is immutable, so fix it **before** the deploy: `--release`, then re-run with the larger count.
 
 > **It cannot be derived here.** `configure` sets `run.env`'s `REGISTRY_REQUESTED` from the values
 > file, but it runs at Step 4 and this runs at Step 1b, so the count has to be passed in. Read it off
