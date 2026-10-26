@@ -84,9 +84,11 @@ cs_init
 # How many contiguous addresses to reserve — the number of LoadBalancer
 # consumers the box will have, and a property of the RUN, not a policy of this
 # script. The shipped profile has three LoadBalancer Services — the envoy
-# gateway, grafana, and cuberouter — so the default is three. A registry exposed
-# through LoadBalancer adds a fourth; with the registry on NodePort (the normal
-# shape) or off, three is still the count, because the other three remain.
+# gateway, grafana, and cuberouter — plus the registry when it is exposed
+# through LoadBalancer. The default is four: the three are always used, and the
+# fourth is the registry's when it is LoadBalancer-exposed (spare when the
+# registry is NodePort or off). Over-reserving by one is cheaper than an
+# immutable count that leaves a Service <pending>.
 #
 # `configure` sets run.env's REGISTRY_REQUESTED from the values file, but it runs
 # at Step 4 and this script runs at Step 1b, so the count cannot be derived from
@@ -130,10 +132,11 @@ reserve-vips [options]
   --ipam-pool NAME   the host IPPool to claim from (default: the only one there)
   --owner-vm NAME    the VirtualMachine to own the request (default: the box's
                      master node, resolved from run.env's VM_NAMES)
-  --count N          how many contiguous addresses to reserve (default 3). The
+  --count N          how many contiguous addresses to reserve (default 4). The
                      shipped profile has three LoadBalancer consumers — envoy
-                     gateway, grafana and cuberouter — so 3 is the normal count;
-                     a registry exposed through LoadBalancer adds one (4).
+                     gateway, grafana and cuberouter — plus the registry when it
+                     is exposed through LoadBalancer. The fourth is spare when
+                     the registry is NodePort or off.
                      FIRST INVOCATION ONLY: the count is immutable, so a re-run
                      with no --count reuses the recorded one, and a --count that
                      disagrees with it fails. To change it before the deploy,
@@ -410,7 +413,7 @@ DEPLOYED=0
 [ -f "$(cs_run_dir)/deploy-nodeset" ] && DEPLOYED=1
 
 # The count this invocation would ask for if it had to create the request.
-DISPLAY_COUNT="${COUNT:-${REC_RANGE_COUNT:-3}}"
+DISPLAY_COUNT="${COUNT:-${REC_RANGE_COUNT:-4}}"
 
 # --- count immutability, the local half --------------------------------------
 # spec.count cannot be changed, so a --count that disagrees with the recorded one
@@ -731,7 +734,7 @@ fi
 
 # The count, resolved last so that everything recorded outranks the default: an
 # explicit --count, else what a previous invocation recorded, else 2.
-[ "$COUNT_GIVEN" -eq 1 ] || COUNT="${REC_RANGE_COUNT:-3}"
+[ "$COUNT_GIVEN" -eq 1 ] || COUNT="${REC_RANGE_COUNT:-4}"
 
 YAML="apiVersion: ipam.cubestack.io/v1alpha1
 kind: IPRangeRequest

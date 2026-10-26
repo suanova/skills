@@ -188,7 +188,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 4 | VM owner label | `owner=$USER` |
 | 5 | SSH password | `ubuntu` |
 | 6 | MinIO endpoint + keys | **built-in** — the Cluster facts row above; never ask |
-| 7 | Service expose mode | **`metallb`** (LoadBalancer) — MetalLB is a **required** component and this is the default. The pool is **not chosen here**: **Step 1b** reserves a contiguous block of addresses from the host's cubestack-ipam (`--count`, default 2; use `1` when the registry is off) and hands that block to the installer, so every address MetalLB can reach is already bound to this box in the ledger. Nothing is patched after the deploy. `--expose nodeport` is an explicit opt-out, and it also releases the `verify` gate |
+| 7 | Service expose mode | **`metallb`** (LoadBalancer) — MetalLB is a **required** component and this is the default. The pool is **not chosen here**: **Step 1b** reserves a contiguous block of addresses from the host's cubestack-ipam (`--count`, default 4: the envoy gateway, grafana and cuberouter always take three, and a registry exposed through `LoadBalancer` takes the fourth — spare when the registry is NodePort or off) and hands that block to the installer, so every address MetalLB can reach is already bound to this box in the ledger. Nothing is patched after the deploy. `--expose nodeport` is an explicit opt-out, and it also releases the `verify` gate |
 | 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>` |
 | 9 | External Ceph | **required** — ask for the Provider's exported `external-ceph.env` path (`--external-ceph-env`). Not an optional storage extra: on the minimal profile it is what the registry's PVC binds to (see *Minimal profile*), so a run without it is not this profile |
 | 10 | Model store on the nodes | off unless the user asks for it — then ask for the Provider's CephFS Linux-host mount guide path (`--cephfs-mount-guide`). Independent of #9: a run can import external Ceph without wanting `/models` on the hosts, and a guide alone does not import anything |
@@ -585,10 +585,10 @@ and has no opinion on which mode you meant.
 
 The three are coupled, and the coupling is the installer's:
 
-- **`--count 2` at Step 1b.** With MetalLB on *and* the registry on there are two consumers of the
-  reserved block — the registry takes its low address, the gateway's data plane the high one. That
-  is Step 1b's default, so the profile needs no flag; a box with the registry off reserves
-  `--count 1` instead, which is why the flag exists.
+- **`--count 4` at Step 1b.** With MetalLB on there are three LoadBalancer consumers — the envoy
+  gateway, grafana and cuberouter — and a registry exposed through LoadBalancer is a fourth. That
+  is Step 1b's default; with the registry on NodePort or off the fourth address is spare, which is
+  the safe side of an immutable count.
 - **External Ceph is where the registry lives.** Its PVC binds to `local-path` unless Ceph is on
   (*The registry and its storage backend* above), and requiring Ceph is what turns local-path off.
   So on this profile the import is not a storage extra bolted on beside the registry — it is the
@@ -834,8 +834,9 @@ id; a `preflight` re-run also resets it.
 and records the range as `POOL_RANGE`. `configure` feeds that to the installer as `METALLB_POOL`.
 That is the whole flow — one step, before the box exists, and nothing touches MetalLB or any
 Service after the deploy finishes. The block is **as many addresses as the box has LoadBalancer
-consumers** (`--count`, default 2): two for a box with the registry on, one for a box with
-`REGISTRY_ENABLED='false'`, where the gateway is the only consumer.
+consumers** (`--count`, default 4): the envoy gateway, grafana and cuberouter always take three;
+a registry exposed through LoadBalancer takes the fourth, which is spare when the registry is
+NodePort or off.
 
 1. **One `IPRangeRequest`, not a claim per address.** `poolRef` + `count`, which is the whole spec.
    It carries an `ownerReferences` entry pointing at the box's **master node's `VirtualMachine`**
@@ -1184,10 +1185,11 @@ It reserves a **contiguous block** of addresses from the host's cubestack-ipam a
 that block to the installer as `METALLB_POOL`. See **VIPs come from the host's IPAM** above for why
 the addresses are reserved rather than chosen, and what the request is.
 
-**How many addresses is `--count`, and it is a property of the run.** The default is 3: the shipped
-profile exposes the envoy gateway, grafana and cuberouter through `LoadBalancer`. A registry exposed
-through `LoadBalancer` is a fourth consumer; with the registry on NodePort (the normal shape) or with
-`REGISTRY_ENABLED='false'`, the count is still **3**, because the other three remain.
+**How many addresses is `--count`, and it is a property of the run.** The default is 4: the shipped
+profile exposes the envoy gateway, grafana and cuberouter through `LoadBalancer` (three), and a
+registry exposed through `LoadBalancer` is the fourth. With the registry on NodePort (the normal
+shape) or with `REGISTRY_ENABLED='false'`, the fourth address is spare — over-reserving by one is
+cheaper than an immutable count that leaves a Service pending.
 
 > A pending Service in `verify`'s `vip_pending=` means the reserved block was too small. `spec.count`
 > is immutable, so fix it **before** the deploy: `--release`, then re-run with the larger count.

@@ -232,11 +232,13 @@ def main():
     # environment. Without them the deploy reads deployments/offline-files/, the
     # rolling dev tree. A release-capable installer declares both keys in
     # cluster.defaults.conf; append=True also keeps an older installer, which has
-    # no such keys, from failing a dev run.
+    # no such keys, from failing a dev run. subst() runs even for an empty value:
+    # a dev run over a config written by an earlier release run must clear the
+    # stale selectors rather than leave them behind.
     for key in ("CUBESTACK_RELEASE", "CUBESTACK_RELEASE_ROOT"):
         value = env(key)
+        subst(key, value, append=True)
         if value:
-            subst(key, value, append=True)
             applied.append(key)
 
     # --- NODES --------------------------------------------------------------

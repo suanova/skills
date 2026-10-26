@@ -222,13 +222,31 @@ fi
 if [ -n "$REL" ]; then
   # The pod-side fetch has been seen to land one level too deep
   # (<version>/offline-files/offline-files/...). Flatten it before grading, so a
-  # complete tree is not reported partial by its own layout.
-  nested="$REL_ROOT/$REL/offline-files/offline-files"
+  # complete tree is not reported partial by its own layout. Entries are merged
+  # (an existing directory of the same name is populated, not refused), and
+  # _SUCCESS moves last: an interrupted flatten then leaves the tree visibly
+  # incomplete and the next run retries instead of trusting a partial parent.
+  parent="$REL_ROOT/$REL/offline-files"
+  nested="$parent/offline-files"
   if cs_pod_exec "$CS_POD" bash -c \
-       "[ -f '$nested/_SUCCESS' ] && [ ! -f '$REL_ROOT/$REL/offline-files/_SUCCESS' ]" >/dev/null 2>&1; then
+       "[ -f '$nested/_SUCCESS' ] && [ ! -f '$parent/_SUCCESS' ]" >/dev/null 2>&1; then
     cs_note "release tree landed one level too deep; flattening $REL/offline-files/offline-files"
-    cs_pod_exec "$CS_POD" bash -c \
-      "shopt -s dotglob; mv '$nested'/* '$REL_ROOT/$REL/offline-files/' && rmdir '$nested'" >/dev/null 2>&1 \
+    cs_pod_exec "$CS_POD" bash -c "
+      set -e
+      shopt -s dotglob nullglob
+      for e in '$nested'/*; do
+        b=\$(basename \"\$e\")
+        [ \"\$b\" = _SUCCESS ] && continue
+        if [ -d \"\$e\" ] && [ -d '$parent'/\$b ]; then
+          cp -a \"\$e\"/. '$parent'/\$b/
+          rm -rf \"\$e\"
+        else
+          mv \"\$e\" '$parent'/
+        fi
+      done
+      mv '$nested/_SUCCESS' '$parent/_SUCCESS'
+      rmdir '$nested'
+    " >/dev/null 2>&1 \
       || cs_fail E_FETCH_PARTIAL "release=$REL" "layout=nested" recover="rerun:fetch-offline" \
            hint="the release tree is nested (offline-files/offline-files) and could not be flattened"
   fi
