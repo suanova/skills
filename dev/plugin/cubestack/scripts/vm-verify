@@ -114,7 +114,7 @@ REMOTE
 )"
 rc=$?
 if [ "$rc" -eq 0 ]; then
-  cs_ok "vms=$(printf '%s\n' "$out" | grep -c 'Ready' || true)" "master=$MASTER_IP"
+  cs_ok "master=$MASTER_IP" "verified=1"
 fi
 printf '%s\n' "$out" | tail -20 >&2
 cs_fail E_VERIFY "master=$MASTER_IP" recover=stop-report:user \
