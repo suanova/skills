@@ -103,10 +103,10 @@ CS_PULL_SECRET="harbor-credentials"
 # model-bundles share) plus these four. `monitoring` is shared by prometheus,
 # perses and observability; `cuberouter` holds cuberouter. Two catalog
 # namespaces are deliberately NOT here:
-#   * metax-operator — `exporters.metax` installs no workload. It is a patch of
-#     a cluster-scoped CR, so nothing in that namespace pulls an image, and the
-#     namespace itself belongs to the vendor MetaX operator
-#     (`createNamespace: false`).
+#   * metax-operator — 2.1's metax-data-exporter runs there, but it pulls from
+#     the in-cluster registry (usually anonymous). The namespace belongs to the
+#     vendor MetaX operator (`createNamespace: false`); add it here only if that
+#     registry requires a pull Secret.
 #   * the namespace of `exporters.bmc`, which is `monitoring` anyway — the
 #     component is disabled in the profile.
 # Pre-creating a namespace is safe: the operator's EnsureNamespace is a
