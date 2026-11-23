@@ -39,6 +39,7 @@ MASTER_USER="$(cs_run_env_get VM_MASTER_USER)"
 SSH_KEY="$(cs_run_env_get VM_SSH_KEY)"
 [ -n "$MASTER_IP" ] && [ -n "$MASTER_USER" ] && [ -n "$SSH_KEY" ] \
   || cs_usage_fail "run.env has no VM master/key; run vm-install first"
+case "$CONTAINER" in ''|*[!A-Za-z0-9._-]*) cs_usage_fail "--container has unsupported characters" ;; esac
 
 SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
           -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15)

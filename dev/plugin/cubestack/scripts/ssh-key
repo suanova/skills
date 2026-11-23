@@ -75,6 +75,10 @@ fi
 
 [ -f "$KEY" ] || cs_fail E_SSH_KEY "key=$KEY" recover=stop-report:user \
   hint="no SSH private key at $KEY; pass --key with an unencrypted key"
+case "$KEY" in *[[:space:]]*)
+  cs_fail E_USAGE recover=stop-report:user \
+    hint="the SSH key path contains whitespace, which breaks the verdict grammar; move it somewhere without spaces" ;;
+esac
 
 PUB="${KEY}.pub"
 if [ ! -f "$PUB" ]; then

@@ -71,6 +71,9 @@ done
 [ -n "$VALUES" ] || cs_usage_fail "--values is required"
 [ -n "$RELEASE" ] || cs_usage_fail "--release is required (vm-install is for 2.1+ releases)"
 RUN_ID="$(cs_run_id)" || cs_usage_fail "--run is required (pass the run id printed by preflight)"
+if [ "$NO_OPERATOR" -eq 1 ] && [ -n "$SKIP" ]; then
+  cs_usage_fail "--no-operator cannot be combined with --skip: installer #216 makes --skip override --with-k8s"
+fi
 case "$RELEASE" in
   *[!0-9A-Za-z._-]*) cs_usage_fail "--release contains unsupported characters: $RELEASE" ;;
   2.0|2.0.*) cs_usage_fail "vm-install is for 2.1+; use the pod path for 2.0" ;;
@@ -78,6 +81,7 @@ esac
 
 cs_values_lint "$VALUES" SSH_PW NODES_MASTER MINIO_EP MINIO_AK MINIO_SK
 [ -n "$EXT_ENV" ] || EXT_ENV="$(cs_run_env_get EXTERNAL_CEPH_ENV_FILE)"
+[ -n "$EXT_ENV" ] && cs_ceph_env_lint "$EXT_ENV"
 [ -n "$HARBOR_RO" ] || HARBOR_RO="$(cs_run_env_get HARBOR_RO_VALUES_FILE)"
 [ -n "$SKIP" ] && case "$SKIP" in *[!0-9A-Za-z_,-]*) cs_usage_fail "--skip has unsupported characters" ;; esac
 
@@ -88,6 +92,10 @@ set -a
 set +a
 [ -n "${NODES_MASTER:-}" ] || cs_usage_fail "NODES_MASTER is empty in $VALUES"
 [ -n "${SSH_PW:-}" ] || cs_usage_fail "SSH_PW is empty in $VALUES"
+if [ "${CEPH_MODE:-}" = "external" ] && [ -z "$EXT_ENV" ]; then
+  cs_fail E_CONF_VALUES_MISSING "ceph_mode=external" recover=stop-report:user \
+    hint="CEPH_MODE=external requires --external-ceph-env (or EXTERNAL_CEPH_ENV_FILE in run.env)"
+fi
 
 MASTER_HOST="$(printf '%s' "$NODES_MASTER" | cut -d, -f2)"
 MASTER_IP="$(printf '%s' "$NODES_MASTER" | cut -d, -f3)"
@@ -96,9 +104,11 @@ MASTER_USER="$(printf '%s' "$NODES_MASTER" | cut -d, -f4)"
   || cs_usage_fail "NODES_MASTER must look like role,host,ip,user,-"
 
 # --- SSH identity -----------------------------------------------------------
-key_args=()
-[ -n "$SSH_KEY_OPT" ] && key_args=(--key "$SSH_KEY_OPT")
-KEY_OUT="$("$SELF_DIR/ssh-key" --run "$RUN_ID" "${key_args[@]}" 2>&1)"
+if [ -n "$SSH_KEY_OPT" ]; then
+  KEY_OUT="$("$SELF_DIR/ssh-key" --run "$RUN_ID" --key "$SSH_KEY_OPT" 2>&1)"
+else
+  KEY_OUT="$("$SELF_DIR/ssh-key" --run "$RUN_ID" 2>&1)"
+fi
 rc=$?
 [ "$rc" -eq 0 ] || { printf '%s\n' "$KEY_OUT" >&2; cs_fail E_SSH_KEY recover=stop-report:user hint="ssh-key failed"; }
 SSH_KEY="$(printf '%s\n' "$KEY_OUT" | sed -n 's/.* key=\([^ ]*\) .*/\1/p' | tail -1)"
@@ -121,13 +131,29 @@ LINE="$(printf '%s' "$RELEASE" | sed -nE 's/^([0-9]+\.[0-9]+).*/\1/p')"
 
 MODE=""
 [ "$NO_OPERATOR" -eq 1 ] && MODE="--with-k8s"
+OPERATOR_IMAGES="$(cs_run_env_get OPERATOR_IMAGES)"
+if [ -n "$EXT_ENV" ] && [ ! -f "$EXT_ENV" ]; then
+  cs_fail E_CONF_VALUES_MISSING "file=$EXT_ENV" recover=stop-report:user \
+    hint="the external-ceph.env path was recorded or passed but the file does not exist"
+fi
+if [ -n "$CR_VALUES" ] && [ ! -f "$CR_VALUES" ]; then
+  cs_fail E_CONF_VALUES_MISSING "file=$CR_VALUES" recover=stop-report:user \
+    hint="--cr-values points at a file that does not exist"
+fi
 ONLINE="false"
-[ "$(cs_run_env_get OPERATOR_IMAGES)" = "online" ] && ONLINE="true"
-[ -n "$HARBOR_RO" ] && [ -f "$HARBOR_RO" ] || ONLINE="false"
-[ -n "$EXT_ENV" ] && [ -f "$EXT_ENV" ] || EXT_ENV=""
+if [ "$OPERATOR_IMAGES" = "online" ] || { [ -z "$OPERATOR_IMAGES" ] && [ -n "$HARBOR_RO" ]; }; then
+  [ -n "$HARBOR_RO" ] || cs_fail E_CONF_VALUES_MISSING "operator=online" \
+    recover=rerun:preflight hint="online operator images need --harbor-ro-values (or run preflight with a robot credential)"
+  [ -f "$HARBOR_RO" ] || cs_fail E_CONF_VALUES_MISSING "file=$HARBOR_RO" \
+    recover=stop-report:user hint="the recorded Harbor robot credential no longer exists"
+  ONLINE="true"
+fi
 EXPOSE="$(cs_run_env_get EXPOSE)"; [ -n "$EXPOSE" ] || EXPOSE="metallb"
 POOL="$(cs_run_env_get POOL_RANGE)"
 DNS="$(cs_run_env_get UPSTREAM_DNS_SERVERS)"
+[ -n "${SERVICE_EXPOSE_MODE:-}" ] && EXPOSE="$SERVICE_EXPOSE_MODE"
+[ -n "${METALLB_POOL:-}" ] && POOL="$METALLB_POOL"
+[ -n "${UPSTREAM_DNS_SERVERS:-}" ] && DNS="$UPSTREAM_DNS_SERVERS"
 if [ "$EXPOSE" != "nodeport" ] && [ -z "$POOL" ]; then
   cs_fail E_VIP_POOL_MISSING "expose=$EXPOSE" recover="rerun:reserve-vips" \
     hint="Step 1b (reserve-vips) has not run for this run id; a metallb run needs its pool"
@@ -198,12 +224,35 @@ fi
 ssh_master "chmod 600 /data/install/values.conf /data/install/ssh/cubestack_k8s /data/install/external-ceph.env /data/install/harbor-ro.conf 2>/dev/null || true; chmod 755 /data/install/fetch-release-tree.sh; chmod 644 /data/install/cubestack-apply-conf.py" >/dev/null 2>&1 || true
 
 # --- tools, fetch, CLI, config, container -----------------------------------
-# shellcheck disable=SC2087
-ssh_master bash -s -- "$RELEASE" "$LINE" "$MODE" "$FRESH" "$SKIP" "$ONLINE" "$EXT_ENV" "$CR_VALUES" "$MASTER_USER" "$EXPOSE" "$POOL" "$DNS" <<'REMOTE'
+# ssh joins argv with spaces, so an empty optional value would disappear and
+# shift every later positional. Pass the setup values as shell assignments on
+# stdin; the remote script is the rest of stdin.
+remote_script="$(mktemp)"
+{
+  printf 'REL=%q\n' "$RELEASE"
+  printf 'LINE=%q\n' "$LINE"
+  printf 'MODE=%q\n' "$MODE"
+  printf 'FRESH=%q\n' "$FRESH"
+  printf 'SKIP=%q\n' "$SKIP"
+  printf 'ONLINE=%q\n' "$ONLINE"
+  printf 'EXT=%q\n' "$EXT_ENV"
+  printf 'CR=%q\n' "$CR_VALUES"
+  printf 'VUSER=%q\n' "$MASTER_USER"
+  printf 'EXPOSE=%q\n' "$EXPOSE"
+  printf 'POOL=%q\n' "$POOL"
+  printf 'DNS=%q\n' "$DNS"
+  cat <<'REMOTE'
 set -euo pipefail
-REL="$1"; LINE="$2"; MODE="$3"; FRESH="$4"; SKIP="$5"; ONLINE="$6"; EXT="$7"; CR="$8"; VUSER="$9"
-EXPOSE="${10}"; POOL="${11}"; DNS="${12}"
 sudo true >/dev/null 2>&1 || { echo "FAIL: sudo is not passwordless for $VUSER"; exit 1; }
+
+# Never re-fetch over a tree a live deploy is reading, and never rm its
+# container. The pod path refuses this same case with E_DEPLOY_ALREADY_RUNNING.
+if sudo podman ps --format '{{.Names}}' 2>/dev/null | grep -qx cubestack-cli; then
+  if sudo podman exec cubestack-cli pgrep -f deploy-cluster.sh >/dev/null 2>&1; then
+    echo "FAIL: a deploy is still running in cubestack-cli; wait for vm-deploy-wait or run vm-down first"
+    exit 12
+  fi
+fi
 
 if ! command -v podman >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 \
    || ! command -v python3 >/dev/null 2>&1; then
@@ -260,6 +309,10 @@ set -a
 . /data/install/values.conf
 [ -f /data/install/harbor-ro.conf ] && . /data/install/harbor-ro.conf
 set +a
+# A previous run's Ceph/CR files must not leak into a run that did not ask for
+# them: the container would mount/source them silently.
+[ -z "$EXT" ] && rm -f /data/install/external-ceph.env
+[ -z "$CR" ] && rm -f /data/install/cr-values.yaml
 export SERVICE_EXPOSE_MODE="${SERVICE_EXPOSE_MODE:-$EXPOSE}"
 export METALLB_POOL="${METALLB_POOL:-$POOL}"
 if [ -z "${UPSTREAM_DNS_SERVERS:-}" ] && [ -z "$DNS" ]; then
@@ -317,7 +370,14 @@ setsid nohup bash -c "sudo podman exec cubestack-cli bash -lc '$cmd'; echo \$? >
   > /data/install/install.log 2>&1 < /dev/null &
 echo "image=$image"
 REMOTE
+} > "$remote_script"
+ssh_master bash -s < "$remote_script"
 rc=$?
+rm -f "$remote_script"
+if [ "$rc" -eq 12 ]; then
+  cs_fail E_DEPLOY_ALREADY_RUNNING "master=$MASTER_IP" recover=stop-report:user \
+    hint="a deploy is still running in cubestack-cli; wait for vm-deploy-wait or run vm-down first"
+fi
 if [ "$rc" -ne 0 ]; then
   cs_fail E_VM_INSTALL "release=$RELEASE" "master=$MASTER_IP" recover=stop-report:user \
     hint="vm-install setup failed (see the remote output above)"

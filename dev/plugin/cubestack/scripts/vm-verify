@@ -14,13 +14,15 @@ cs_init
 
 K8S_ONLY=0
 CONTAINER="cubestack-cli"
+SETTLE=30
 
 usage() {
   cat <<'USAGE'
-vm-verify [--run ID] [--k8s-only] [--container NAME]
+vm-verify [--run ID] [--k8s-only] [--container NAME] [--settle SECONDS]
   --run ID          run id (default: this run's id)
   --k8s-only        verify only the k8s box (no CubeStackCluster/portal)
   --container NAME  podman container (default cubestack-cli)
+  --settle SECONDS  wait before the first check (default 30; 0 skips)
   -h, --help        this text
 USAGE
 }
@@ -30,10 +32,15 @@ while [ $# -gt 0 ]; do
     --run)       cs_need_val "$@"; cs_run_opt "${2:-}"; shift 2 ;;
     --k8s-only)  K8S_ONLY=1; shift ;;
     --container) cs_need_val "$@"; CONTAINER="${2:-}"; shift 2 ;;
+    --settle)    cs_need_val "$@"; SETTLE="${2:-}"; shift 2 ;;
     -h|--help)   usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
   esac
 done
+
+cs_kv_nonnumeric "$SETTLE" && cs_usage_fail "--settle must be a non-negative integer"
+[ "$SETTLE" -eq 0 ] || sleep "$SETTLE"
+case "$CONTAINER" in ''|*[!A-Za-z0-9._-]*) cs_usage_fail "--container has unsupported characters" ;; esac
 
 MASTER_IP="$(cs_run_env_get VM_MASTER_IP)"
 MASTER_USER="$(cs_run_env_get VM_MASTER_USER)"
@@ -72,9 +79,15 @@ if [ "$K8S_ONLY" = "0" ]; then
     ready="$(k -n cubestack-system get cubestackcluster "$cr" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
     phases="$(k -n cubestack-system get cubestackcluster "$cr" -o jsonpath='{range .status.components[*]}{.name}={.phase}{"\n"}{end}' 2>/dev/null)"
     ct="$(printf '%s\n' "$phases" | grep -c . || true)"
+    skipped="$(printf '%s\n' "$phases" | grep -c '=Skipped' || true)"
+    ct=$((ct - skipped))
     cr_ready="$(printf '%s\n' "$phases" | grep -c '=Ready' || true)"
     [ "$ready" = "True" ] && note cubestackcluster "$cr Ready=True" || bad cubestackcluster "$cr Ready=${ready:-unknown}"
-    if [ "${cr_ready:-0}" -eq "${ct:-0}" ] && [ "${ct:-0}" -gt 0 ]; then note components "${cr_ready}/${ct} Ready"; else bad components "${cr_ready}/${ct} Ready"; fi
+    if [ "${ct:-0}" -gt 0 ] && [ "${cr_ready:-0}" -eq "${ct:-0}" ]; then
+      note components "${cr_ready}/${ct} Ready (${skipped} skipped)"
+    else
+      bad components "${cr_ready}/${ct} Ready (${skipped} skipped)"
+    fi
   else
     bad cubestackcluster "not found in cubestack-system"
   fi

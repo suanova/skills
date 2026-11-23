@@ -1270,7 +1270,8 @@ so a re-run whose request has gone missing *and* whose run has already deployed 
 > writes `cluster.conf`, and starts the installer container with podman on the master VM.
 > It does **not** use `cubestack-installer-cli:latest`. A metallb run still needs Step 1b
 > (`reserve-vips`) first: `vm-install` reads `POOL_RANGE` from `run.env`. For a 2.1+ release
-> do **not** run `pod-up` or Steps 3–6; they are the dev/2.0 pod path.
+> do **not** run `pod-up` or Steps 3–6; they are the dev/2.0 pod path. `--no-operator`
+> cannot be combined with `--skip` until installer #216 is fixed.
 
 ```bash
 "$S/pod-up" --run <run-id>          # --subnet defaults to run.env SUBNET
@@ -1544,7 +1545,8 @@ hatch for the case the drift check cannot see (same node set, a state you need d
 > applies the CR. Use `vm-verify` (not `verify` / `operator-up` / `operator-wait`) and
 > `vm-down` (not `pod-down`). With `--no-operator`, run `vm-verify --k8s-only`; the run ends
 > with the k8s box. The Provider's `/models` mount is handled by the installer's
-> `cephfs_mount` module when the values enable it; `mount-models` is pod-only.
+> `cephfs_mount` module when the values enable it; `mount-models` is pod-only. `vm-verify`
+> waits 30 s before its first check to let the cluster settle (`--settle 0` skips it).
 
 ```bash
 "$S/verify" --run <run-id> --expect-nodes 3   # external-Ceph checks turn on by themselves for an importing run
