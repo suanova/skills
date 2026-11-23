@@ -1655,9 +1655,11 @@ What the pair does, in order, and why the order is not negotiable:
   four more components (the controller-manager, cubepilot, the portal and the model bundles),
   and the Secret goes into `lws-system`, `envoy-gateway-system`, `ai-gateway-system`,
   `monitoring` (shared by prometheus, perses and observability) and `cuberouter`. Two catalog
-  namespaces are deliberately absent: `metax-operator`, because
-  `exporters.metax` is a *patch* of a cluster-scoped object and installs no workload, so
-  nothing there pulls an image — and the namespace belongs to the vendor MetaX operator
+  namespaces are deliberately absent: `metax-operator`, because in 2.0
+  `exporters.metax` is a *patch* of a cluster-scoped object and installs no workload, while
+  in 2.1 `metax-data-exporter` runs there and pulls `metax/mx-exporter` from the in-cluster
+  registry. Add the namespace (and a pull Secret) only if that registry requires
+  authentication; the namespace belongs to the vendor MetaX operator
   (`createNamespace: false`). The Secret
   is built from the values file inside the pod (`--from-file`, never the `--docker-password`
   flag, which would put the token in the pod's process list).

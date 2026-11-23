@@ -207,12 +207,16 @@ has_legacy="$(cs_pod_exec "$CS_POD" bash -c \
 
 if [ -n "$REL" ]; then
   cs_note "fetching release $REL via the release fetch-offline.sh"
+  # Derive the line from the release/snapshot name (2.2.0 -> 2.2,
+  # 2.1-SNAPSHOT-... -> 2.1); keep 2.1 for names without a line prefix.
+  rel_line="$(printf '%s' "$REL" | sed -nE 's/^([0-9]+\.[0-9]+)([.-].*)?$/\1/p')"
+  line="${CUBESTACK_LINE:-${rel_line:-2.1}}"
   cs_logged kubectl -n "$CS_NS" cp "$SELF_DIR/lib/fetch-release-tree.sh" \
     "$CS_NS/$CS_POD:/tmp/fetch-release-tree.sh" || \
     cs_fail E_POD_EXEC "pod=$CS_POD" recover=rerun:pod-up \
       hint="could not copy the release fetch helper in"
   fetch_out="$(cs_pod_exec "$CS_POD" bash -c \
-    "bash /tmp/fetch-release-tree.sh '$REL' '$REL_ROOT' '$POD_VALUES' '${CUBESTACK_LINE:-2.1}' 2>&1")"
+    "bash /tmp/fetch-release-tree.sh '$REL' '$REL_ROOT' '$POD_VALUES' '$line' 2>&1")"
   rc=$?
   if [ "$rc" -eq 13 ] && [ "$has_legacy" = "1" ]; then
     cs_note "no fetch-offline.sh at the release prefix; falling back to the legacy 2.0 fetcher"
@@ -236,6 +240,14 @@ if [ "$rc" -ne 0 ]; then
       cs_fail E_FETCH_AUTH "rc=$rc" "file=$VALUES" \
         recover="fix-values:$VALUES:MINIO_AK,MINIO_SK" \
         hint="MinIO rejected the credentials after minio.conf was written" ;;
+    *"FAIL: auth probing"*|*"FAIL: cannot access"*)
+      cs_fail E_FETCH_AUTH "rc=$rc" "file=$VALUES" \
+        recover="fix-values:$VALUES:MINIO_AK,MINIO_SK" \
+        hint="$(printf '%s' "$fetch_out" | grep -m1 'FAIL:' | cut -c1-120)" ;;
+    *"FAIL: transport probing"*)
+      cs_fail E_FETCH_NETWORK "rc=$rc" "endpoint=$(cs_run_env_get MINIO_EP)" \
+        recover="rerun:fetch-offline" \
+        hint="$(printf '%s' "$fetch_out" | grep -m1 'FAIL:' | cut -c1-120)" ;;
     *"FAIL: no release/snapshot prefix"*|*"FAIL: could not download fetch-offline.sh"*|*"FAIL: mc alias set"*)
       cs_fail E_FETCH_RELEASE "rc=$rc" "release=$REL" recover="rerun:preflight" \
         hint="$(printf '%s' "$fetch_out" | grep -m1 'FAIL:' | cut -c1-120)" ;;

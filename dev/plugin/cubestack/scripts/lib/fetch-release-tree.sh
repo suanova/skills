@@ -6,7 +6,7 @@
 #   $1 version (release or snapshot name)
 #   $2 destination root (<root>/<version> is created)
 #   $3 values file with MINIO_EP / MINIO_AK / MINIO_SK
-#   $4 line (default 2.1)
+#   $4 line (e.g. 2.1; derived from the version by the caller)
 set -uo pipefail
 
 rel=$1
@@ -27,23 +27,45 @@ if ! mc alias set "$alias_name" "$MINIO_EP" "$MINIO_AK" "$MINIO_SK" >/dev/null 2
   exit 12
 fi
 
+# mc commands take ALIAS/BUCKET/KEY, not s3:// URIs; the released fetch-offline.sh
+# still needs the s3:// form, so keep both.
+mc_path() {
+  local rest="${1#s3://}"
+  printf '%s/%s' "$alias_name" "$rest"
+}
+
 store=s3://cubestack-installer/release-store
+if ! mc ls "$(mc_path "$store")/" >/dev/null 2>&1; then
+  echo "FAIL: cannot access $store (auth or transport)"
+  exit 14
+fi
+
 prefix=""
 for cand in \
   "$store/lines/$line/releases/$rel" \
   "$store/lines/$line/snapshots/$rel" \
   "s3://cubestack-installer/offline-packages/$line/$rel"; do
-  if mc stat "$cand/fetch-offline.sh" >/dev/null 2>&1; then
+  if out="$(mc stat "$(mc_path "$cand/fetch-offline.sh")" 2>&1)"; then
     prefix="$cand"
     break
   fi
+  case "$out" in
+    *AccessDenied*|*403*|*SignatureDoesNotMatch*|*InvalidAccessKeyId*)
+      echo "FAIL: auth probing $cand: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+      exit 16
+      ;;
+    *"Unable to connect"*|*timeout*|*refused*|*unreachable*|*"no such host"*|*network*)
+      echo "FAIL: transport probing $cand: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+      exit 17
+      ;;
+  esac
 done
 [ -n "$prefix" ] || {
   echo "FAIL: no release/snapshot prefix for $rel (line $line)"
   exit 13
 }
 
-if ! mc cp "$prefix/fetch-offline.sh" /tmp/fetch-offline.sh >/dev/null 2>&1; then
+if ! mc cp "$(mc_path "$prefix/fetch-offline.sh")" /tmp/fetch-offline.sh >/dev/null 2>&1; then
   echo "FAIL: could not download fetch-offline.sh from $prefix"
   exit 14
 fi
@@ -63,7 +85,7 @@ case "$prefix" in
     echo "falling back to mc cp for $prefix"
     rm -rf "$pkg"
     mkdir -p "$pkg"
-    mc cp --recursive "$prefix/" "$pkg/" >/dev/null 2>&1 || {
+    mc cp --recursive "$(mc_path "$prefix")/" "$pkg/" >/dev/null 2>&1 || {
       echo "FAIL: could not download $prefix with mc"
       exit 15
     }
