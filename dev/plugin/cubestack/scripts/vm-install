@@ -104,6 +104,9 @@ rc=$?
 SSH_KEY="$(printf '%s\n' "$KEY_OUT" | sed -n 's/.* key=\([^ ]*\) .*/\1/p' | tail -1)"
 SSH_PUB="$(printf '%s\n' "$KEY_OUT" | sed -n 's/.* pub_file=\([^ ]*\) .*/\1/p' | tail -1)"
 [ -f "$SSH_KEY" ] || cs_fail E_SSH_KEY "key=$SSH_KEY" recover=stop-report:user hint="ssh-key did not return a usable private key"
+[ -n "$SSH_PUB" ] || cs_fail E_SSH_KEY "key=$SSH_KEY" recover=stop-report:user hint="ssh-key did not return a public key path"
+[ -f "$SSH_PUB" ] || cs_fail E_SSH_KEY "pub=$SSH_PUB" recover=stop-report:user hint="the public key file does not exist"
+SSH_KEY="$(cd "$(dirname "$SSH_KEY")" && pwd)/$(basename "$SSH_KEY")"
 
 SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
           -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15)

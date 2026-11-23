@@ -1269,8 +1269,8 @@ so a re-run whose request has gone missing *and* whose run has already deployed 
 > `vm-install` fetches the release tree, loads `cubestack-installer-cli*.tar` from it,
 > writes `cluster.conf`, and starts the installer container with podman on the master VM.
 > It does **not** use `cubestack-installer-cli:latest`. A metallb run still needs Step 1b
-> (`reserve-vips`) first: `vm-install` reads `POOL_RANGE` from `run.env`. The rest of this
-> step and Steps 3–6 describe the pod path used by the dev channel and 2.0.
+> (`reserve-vips`) first: `vm-install` reads `POOL_RANGE` from `run.env`. For a 2.1+ release
+> do **not** run `pod-up` or Steps 3–6; they are the dev/2.0 pod path.
 
 ```bash
 "$S/pod-up" --run <run-id>          # --subnet defaults to run.env SUBNET
