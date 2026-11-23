@@ -1157,7 +1157,10 @@ and **no** `ssh_authorized_keys` (the installer injects its own keypair via sshp
 > password-only VMs cannot be reached in direct mode. The installer's own key
 > injection still happens during the deploy. If your key is not at one of the
 > standard `~/.ssh/id_*` paths, pass `--key <private key>` to `ssh-key` and
-> `vm-install` (the key may have any filename).
+> `--ssh-key <private key>` to `vm-install` (the key may have any filename).
+> The first connection uses `accept-new` and pins the host key in the run dir;
+> for strict verification, pre-seed that `known_hosts` from the VM provisioning
+> path before running `vm-install`.
 
 > **Do not hand it a network name.** Every VM gets its underlay address from a cubestack-ipam
 > pool claim and its own minted NAD (`default/<vm-name>-static`); for the pool case the

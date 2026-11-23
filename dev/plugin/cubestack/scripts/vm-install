@@ -117,11 +117,15 @@ SSH_PUB="$(printf '%s\n' "$KEY_OUT" | sed -n 's/.* pub_file=\([^ ]*\) .*/\1/p' |
 [ -n "$SSH_PUB" ] || cs_fail E_SSH_KEY "key=$SSH_KEY" recover=stop-report:user hint="ssh-key did not return a public key path"
 [ -f "$SSH_PUB" ] || cs_fail E_SSH_KEY "pub=$SSH_PUB" recover=stop-report:user hint="the public key file does not exist"
 SSH_KEY="$(cd "$(dirname "$SSH_KEY")" && pwd)/$(basename "$SSH_KEY")"
+KNOWN_HOSTS="$(cs_run_dir)/known_hosts"
+mkdir -p "$(dirname "$KNOWN_HOSTS")"
+[ -f "$KNOWN_HOSTS" ] || : >"$KNOWN_HOSTS"
+chmod 600 "$KNOWN_HOSTS"
 
-SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15)
-SCP_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null)
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=15)
+SCP_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$KNOWN_HOSTS")
 
 ssh_master() { ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" "$@"; }
 scp_master() { scp "${SCP_OPTS[@]}" "$1" "$MASTER_USER@$MASTER_IP:$2"; }
@@ -320,7 +324,7 @@ if [ -z "${UPSTREAM_DNS_SERVERS:-}" ] && [ -z "$DNS" ]; then
     | grep -vE '^(127\.|169\.254\.)' \
     | while read -r ns; do
         getent hosts harbor.isuanova.com >/dev/null 2>&1 && { echo "$ns"; break; }
-      done)"
+      done || true)"
 fi
 export UPSTREAM_DNS_SERVERS="${UPSTREAM_DNS_SERVERS:-$DNS}"
 case "$ONLINE" in
@@ -360,15 +364,17 @@ sudo podman run -d --name cubestack-cli --network host --entrypoint /bin/bash \
 # cluster.conf and the mounted SSH key. Drop the extra secret copies.
 rm -f /data/install/values.conf /data/install/harbor-ro.conf
 
-rm -f /data/install/deploy.rc
+rm -f /data/install/deploy.*.rc
+ATTEMPT="$(date +%s)-$$"
+printf '%s\n' "$ATTEMPT" > /data/install/deploy.attempt
 skip_arg=""
 [ -n "$SKIP" ] && skip_arg="--skip $SKIP"
 fresh_arg=""
 [ "$FRESH" = "1" ] && fresh_arg="--fresh"
 cmd="set -a; [ -f /data/install/external-ceph.env ] && . /data/install/external-ceph.env; set +a; cd /opt/cubestack-installer; ./deployments/scripts/deploy-cluster.sh $MODE --release $REL --yes $fresh_arg $skip_arg"
-setsid nohup bash -c "sudo podman exec cubestack-cli bash -lc '$cmd'; echo \$? > /data/install/deploy.rc" \
+setsid nohup bash -c "sudo podman exec cubestack-cli bash -lc '$cmd'; echo \$? > /data/install/deploy.$ATTEMPT.rc" \
   > /data/install/install.log 2>&1 < /dev/null &
-echo "image=$image"
+echo "image=$image attempt=$ATTEMPT"
 REMOTE
 } > "$remote_script"
 ssh_master bash -s < "$remote_script"

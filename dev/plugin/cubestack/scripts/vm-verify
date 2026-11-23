@@ -39,7 +39,6 @@ while [ $# -gt 0 ]; do
 done
 
 cs_kv_nonnumeric "$SETTLE" && cs_usage_fail "--settle must be a non-negative integer"
-[ "$SETTLE" -eq 0 ] || sleep "$SETTLE"
 case "$CONTAINER" in ''|*[!A-Za-z0-9._-]*) cs_usage_fail "--container has unsupported characters" ;; esac
 
 MASTER_IP="$(cs_run_env_get VM_MASTER_IP)"
@@ -47,9 +46,11 @@ MASTER_USER="$(cs_run_env_get VM_MASTER_USER)"
 SSH_KEY="$(cs_run_env_get VM_SSH_KEY)"
 [ -n "$MASTER_IP" ] && [ -n "$MASTER_USER" ] && [ -n "$SSH_KEY" ] \
   || cs_usage_fail "run.env has no VM master/key; run vm-install first"
+[ "$SETTLE" -eq 0 ] || sleep "$SETTLE"
 
-SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15)
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$(cs_run_dir)/known_hosts"
+          -o ConnectTimeout=15)
 out="$(ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" bash -s -- "$K8S_ONLY" "$CONTAINER" <<'REMOTE' 2>&1
 set -uo pipefail
 K8S_ONLY="$1"; C="$2"
@@ -69,9 +70,21 @@ total="$(printf '%s\n' "$nodes" | grep -c . || true)"
 if [ "${not_ready:-0}" -eq 0 ] && [ "${total:-0}" -gt 0 ]; then note nodes "${total} Ready"; else bad nodes "${not_ready} not Ready of ${total}"; fi
 
 pods="$(k get pods -A --no-headers 2>/dev/null)"
-not_running="$(printf '%s\n' "$pods" | awk '$4 != "Running" && $4 != "Completed"' | wc -l)"
+bad_pods="$(printf '%s\n' "$pods" | awk '
+  {
+    if ($4 == "Completed") next
+    if ($4 != "Running") { print; next }
+    split($3, r, "/")
+    if (r[1] != r[2]) print
+  }')"
+not_running="$(printf '%s\n' "$bad_pods" | grep -c . || true)"
 ptotal="$(printf '%s\n' "$pods" | grep -c . || true)"
-if [ "${not_running:-0}" -eq 0 ]; then note pods "${ptotal} total, all Running/Completed"; else bad pods "${not_running} not Running of ${ptotal}"; printf '%s\n' "$pods" | awk '$4 != "Running" && $4 != "Completed"' | head -5; fi
+if [ "${not_running:-0}" -eq 0 ]; then
+  note pods "${ptotal} total, all Running/Completed and Ready"
+else
+  bad pods "${not_running} not Running/Ready of ${ptotal}"
+  printf '%s\n' "$bad_pods" | head -5
+fi
 
 if [ "$K8S_ONLY" = "0" ]; then
   cr="$(k -n cubestack-system get cubestackcluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"

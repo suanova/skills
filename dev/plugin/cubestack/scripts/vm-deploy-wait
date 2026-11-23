@@ -45,12 +45,26 @@ SSH_KEY="$(cs_run_env_get VM_SSH_KEY)"
 [ -n "$MASTER_IP" ] && [ -n "$MASTER_USER" ] && [ -n "$SSH_KEY" ] \
   || cs_usage_fail "run.env has no VM master/key; run vm-install first"
 
-SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15)
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$(cs_run_dir)/known_hosts"
+          -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
 start=$(date +%s)
+att=""
 while :; do
-  rc="$(ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" \
-        'cat /data/install/deploy.rc 2>/dev/null || true' 2>/dev/null | tr -d '[:space:]')"
+  elapsed=$(( $(date +%s) - start ))
+  remaining=$(( TIMEOUT - elapsed ))
+  [ "$remaining" -le 0 ] && cs_fail E_DEPLOY_TIMEOUT "elapsed=$elapsed" "budget=${TIMEOUT}s" \
+    recover=stop-report:user \
+    hint="deploy is still running; inspect /data/install/install.log on $MASTER_IP"
+  att_now="$(ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" \
+        'cat /data/install/deploy.attempt 2>/dev/null || true' 2>/dev/null | tr -d '[:space:]')"
+  case "$att_now" in *[!0-9-]*) att_now="" ;; esac
+  [ -n "$att_now" ] && att="$att_now"
+  rc=""
+  if [ -n "$att" ]; then
+    rc="$(ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" \
+        "cat /data/install/deploy.$att.rc 2>/dev/null || true" 2>/dev/null | tr -d '[:space:]')"
+  fi
   if [ -n "$rc" ]; then
     elapsed=$(( $(date +%s) - start ))
     if [ "$rc" = "0" ]; then
@@ -60,11 +74,7 @@ while :; do
       recover=stop-report:user \
       hint="deploy exited non-zero; inspect /data/install/install.log on $MASTER_IP"
   fi
-  elapsed=$(( $(date +%s) - start ))
-  if [ "$elapsed" -ge "$TIMEOUT" ]; then
-    cs_fail E_DEPLOY_TIMEOUT "elapsed=$elapsed" "budget=${TIMEOUT}s" \
-      recover=stop-report:user \
-      hint="deploy is still running; inspect /data/install/install.log on $MASTER_IP"
-  fi
-  sleep "$POLL"
+  poll_sleep="$POLL"
+  [ "$poll_sleep" -gt "$remaining" ] && poll_sleep="$remaining"
+  sleep "$poll_sleep"
 done

@@ -41,9 +41,10 @@ SSH_KEY="$(cs_run_env_get VM_SSH_KEY)"
   || cs_usage_fail "run.env has no VM master/key; run vm-install first"
 case "$CONTAINER" in ''|*[!A-Za-z0-9._-]*) cs_usage_fail "--container has unsupported characters" ;; esac
 
-SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15)
-remote="sudo podman rm -f '$CONTAINER' >/dev/null 2>&1 || true"
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$(cs_run_dir)/known_hosts"
+          -o ConnectTimeout=15)
+remote="if sudo podman ps -a --format '{{.Names}}' | grep -qx '$CONTAINER'; then sudo podman rm -f '$CONTAINER' || exit 1; fi"
 [ "$REMOVE_DATA" -eq 1 ] && remote="$remote; sudo rm -rf /data/install /data/releases /data/pkg"
 if ! ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" "$remote" >/dev/null 2>&1; then
   cs_fail E_SSH_AUTH "master=$MASTER_IP" recover=stop-report:user hint="could not reach the master VM"
