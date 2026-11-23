@@ -73,6 +73,7 @@ done
 RUN_ID="$(cs_run_id)" || cs_usage_fail "--run is required (pass the run id printed by preflight)"
 case "$RELEASE" in
   *[!0-9A-Za-z._-]*) cs_usage_fail "--release contains unsupported characters: $RELEASE" ;;
+  2.0|2.0.*) cs_usage_fail "vm-install is for 2.1+; use the pod path for 2.0" ;;
 esac
 
 cs_values_lint "$VALUES" SSH_PW NODES_MASTER MINIO_EP MINIO_AK MINIO_SK
@@ -281,8 +282,9 @@ import sys
 path, value = sys.argv[1], sys.argv[2]
 text = open(path, encoding="utf-8").read()
 line = 'CUBESTACK_OPERATOR_CR_VALUES_FILE="%s"\n' % value
-if "CUBESTACK_OPERATOR_CR_VALUES_FILE=" not in text:
-    text += ("\n" if text and not text.endswith("\n") else "") + line
+# Append unconditionally: cluster.conf is sourced top-down, so the last
+# assignment wins over an existing/commented example line.
+text += ("\n" if text and not text.endswith("\n") else "") + line
 open(path, "w", encoding="utf-8").write(text)
 PY
 fi
@@ -297,6 +299,10 @@ mounts=(-v "/data/releases/$REL:/opt/cubestack-installer/offline-releases/$REL"
   mounts+=(-v /data/install/external-ceph.env:/opt/cubestack-installer/deployments/config/external-ceph.env)
 sudo podman run -d --name cubestack-cli --network host --entrypoint /bin/bash \
   "${mounts[@]}" -e SSH_KEY_DIR=/data/install/ssh "$image" -c 'sleep infinity' >/dev/null
+
+# values.conf/harbor-ro.conf were only inputs to the rewriter; the deploy reads
+# cluster.conf and the mounted SSH key. Drop the extra secret copies.
+rm -f /data/install/values.conf /data/install/harbor-ro.conf
 
 rm -f /data/install/deploy.rc
 skip_arg=""
