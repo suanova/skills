@@ -248,11 +248,11 @@ if [ "$rc" -ne 0 ]; then
       cs_fail E_FETCH_AUTH "rc=$rc" "file=$VALUES" \
         recover="fix-values:$VALUES:MINIO_AK,MINIO_SK" \
         hint="MinIO rejected the credentials after minio.conf was written" ;;
-    *"FAIL: auth probing"*|*"FAIL: cannot access"*)
+    *"FAIL: auth:"*)
       cs_fail E_FETCH_AUTH "rc=$rc" "file=$VALUES" \
         recover="fix-values:$VALUES:MINIO_AK,MINIO_SK" \
         hint="$(printf '%s' "$fetch_out" | grep -m1 'FAIL:' | cut -c1-120)" ;;
-    *"FAIL: transport probing"*)
+    *"FAIL: transport:"*)
       cs_fail E_FETCH_NETWORK "rc=$rc" "endpoint=$(cs_run_env_get MINIO_EP)" \
         recover="rerun:fetch-offline" \
         hint="$(printf '%s' "$fetch_out" | grep -m1 'FAIL:' | cut -c1-120)" ;;

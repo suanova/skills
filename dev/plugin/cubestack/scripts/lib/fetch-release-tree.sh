@@ -23,8 +23,8 @@ export MC_CONFIG_DIR="/tmp/mc-$$"
 mkdir -p "$MC_CONFIG_DIR"
 alias_name=cs-src
 if ! mc alias set "$alias_name" "$MINIO_EP" "$MINIO_AK" "$MINIO_SK" >/dev/null 2>&1; then
-  echo "FAIL: mc alias set for $MINIO_EP"
-  exit 12
+  echo "FAIL: auth: mc alias set for $MINIO_EP"
+  exit 16
 fi
 
 # mc commands take ALIAS/BUCKET/KEY, not s3:// URIs; the released fetch-offline.sh
@@ -34,10 +34,27 @@ mc_path() {
   printf '%s/%s' "$alias_name" "$rest"
 }
 
+# auth, transport or other — the caller maps the first two to different recoveries.
+mc_error_kind() {
+  case "$1" in
+    *AccessDenied*|*403*|*SignatureDoesNotMatch*|*InvalidAccessKeyId*) echo auth ;;
+    *"Unable to connect"*|*timeout*|*refused*|*unreachable*|*"no such host"*|*network*) echo transport ;;
+    *) echo other ;;
+  esac
+}
+
 store=s3://cubestack-installer/release-store
-if ! mc ls "$(mc_path "$store")/" >/dev/null 2>&1; then
-  echo "FAIL: cannot access $store (auth or transport)"
-  exit 14
+if ! out="$(mc ls "$(mc_path "$store")/" 2>&1)"; then
+  case "$(mc_error_kind "$out")" in
+    auth)
+      echo "FAIL: auth: cannot access $store: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+      exit 16
+      ;;
+    *)
+      echo "FAIL: transport: cannot access $store: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+      exit 17
+      ;;
+  esac
 fi
 
 prefix=""
@@ -49,13 +66,13 @@ for cand in \
     prefix="$cand"
     break
   fi
-  case "$out" in
-    *AccessDenied*|*403*|*SignatureDoesNotMatch*|*InvalidAccessKeyId*)
-      echo "FAIL: auth probing $cand: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+  case "$(mc_error_kind "$out")" in
+    auth)
+      echo "FAIL: auth: probing $cand: $(printf '%s' "$out" | head -1 | cut -c1-120)"
       exit 16
       ;;
-    *"Unable to connect"*|*timeout*|*refused*|*unreachable*|*"no such host"*|*network*)
-      echo "FAIL: transport probing $cand: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+    transport)
+      echo "FAIL: transport: probing $cand: $(printf '%s' "$out" | head -1 | cut -c1-120)"
       exit 17
       ;;
   esac
@@ -65,19 +82,40 @@ done
   exit 13
 }
 
-if ! mc cp "$(mc_path "$prefix/fetch-offline.sh")" /tmp/fetch-offline.sh >/dev/null 2>&1; then
-  echo "FAIL: could not download fetch-offline.sh from $prefix"
+tmp_script="$(mktemp "${TMPDIR:-/tmp}/cubestack-fetch-offline.XXXXXX")" || {
+  echo "FAIL: cannot create a temporary fetch script"
   exit 14
+}
+if ! out="$(mc cp "$(mc_path "$prefix/fetch-offline.sh")" "$tmp_script" 2>&1)"; then
+  case "$(mc_error_kind "$out")" in
+    auth)
+      echo "FAIL: auth: downloading fetch-offline.sh from $prefix: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+      rm -f "$tmp_script"
+      exit 16
+      ;;
+    transport)
+      echo "FAIL: transport: downloading fetch-offline.sh from $prefix: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+      rm -f "$tmp_script"
+      exit 17
+      ;;
+    *)
+      echo "FAIL: could not download fetch-offline.sh from $prefix: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+      rm -f "$tmp_script"
+      exit 14
+      ;;
+  esac
 fi
+chmod +x "$tmp_script"
 
 case "$prefix" in
   */offline-packages/*)
     pkg="/tmp/cubestack-pkg-$rel"
     mkdir -p "$pkg"
-    if bash /tmp/fetch-offline.sh \
+    if bash "$tmp_script" \
       --source "$prefix" --package-dir "$pkg" \
       --dest "$root/$rel" --all --verify \
       --mc-alias "$alias_name" --jobs 8; then
+      rm -f "$tmp_script"
       exit 0
     fi
     # Release trees before #188 cannot populate an empty --package-dir from
@@ -85,17 +123,24 @@ case "$prefix" in
     echo "falling back to mc cp for $prefix"
     rm -rf "$pkg"
     mkdir -p "$pkg"
-    mc cp --recursive "$(mc_path "$prefix")/" "$pkg/" >/dev/null 2>&1 || {
-      echo "FAIL: could not download $prefix with mc"
+    if ! out="$(mc cp --recursive "$(mc_path "$prefix")/" "$pkg/" 2>&1)"; then
+      echo "FAIL: transport: downloading $prefix with mc: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+      rm -f "$tmp_script"
       exit 15
-    }
-    [ -f "$pkg/fetch-offline.sh" ] || cp /tmp/fetch-offline.sh "$pkg/fetch-offline.sh"
-    exec bash "$pkg/fetch-offline.sh" \
+    fi
+    [ -f "$pkg/fetch-offline.sh" ] || cp "$tmp_script" "$pkg/fetch-offline.sh"
+    bash "$pkg/fetch-offline.sh" \
       --package-dir "$pkg" --dest "$root/$rel" --all --verify
+    rc=$?
+    rm -f "$tmp_script"
+    exit "$rc"
     ;;
   *)
-    exec bash /tmp/fetch-offline.sh \
+    bash "$tmp_script" \
       --source "$prefix" --store-root "$store" \
       --mc-alias "$alias_name" --dest "$root/$rel" --verify
+    rc=$?
+    rm -f "$tmp_script"
+    exit "$rc"
     ;;
 esac
