@@ -298,7 +298,7 @@ def main():
         )
     for key in ("SERVICE_EXPOSE_MODE", "METALLB_ENABLED", "REGISTRY_IP"):
         if env(key):
-            subst(key, env(key))
+            subst(key, env(key), append=True)
             applied.append(key)
 
     # --- nodelocaldns upstream resolvers (opt-in: only when supplied) -------
@@ -413,7 +413,7 @@ def main():
     online_mode = env("ONLINE_DEPLOY_CUBESTACK_OPERATOR")
     if online_mode:
         subst("ONLINE_DEPLOY_CUBESTACK_OPERATOR",
-              "true" if truthy(online_mode) else "false")
+              "true" if truthy(online_mode) else "false", append=True)
         applied.append("ONLINE_DEPLOY_CUBESTACK_OPERATOR")
 
     # --- and the credential online mode cannot run without --------------------
@@ -558,7 +558,10 @@ def main():
             )
         for key, value in live.items():
             if value:
-                subst(key, value)
+                # append=True: newer examples dropped the deprecated
+                # CEPH_ENABLED/CEPH_CSI_ENABLED keys; appending keeps this
+                # working on both image generations.
+                subst(key, value, append=True)
                 applied.append(key)
         if env("CEPHFS_FS"):  # CephFS block is all-or-nothing on CEPHFS_FS
             for key, value in cephfs.items():
