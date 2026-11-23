@@ -1393,10 +1393,13 @@ deletes the other's; a shared path would have one script `rm` the file the other
 "$S/fetch-offline" --run <run-id> --values <values file>
 ```
 
-Seeds `deployments/config/minio.conf` (which is what the fetch actually reads — *not*
-`cluster.conf`) via a repo helper, byte-gates it, then fetches the offline tree. Idempotent: `du`
-on `offline-files/` is the only evidence a prior fetch completed, so a re-run above the floor
-returns `skipped=1`. A partial tree is `E_FETCH_PARTIAL`, never silently accepted.
+For the dev channel and 2.0 legacy fetches it seeds `deployments/config/minio.conf` (which is
+what those fetchers actually read — *not* `cluster.conf`) via a repo helper and byte-gates it.
+A 2.1+ release tree skips that file entirely: its own `fetch-offline.sh` reads the values file
+directly, and newer CLI images no longer ship `minio.conf.example`. Idempotent: `du` on
+`offline-files/` is the only evidence a dev fetch completed, so a re-run above the floor returns
+`skipped=1`; a release tree is graded on `_SUCCESS`/`release.env`/CLI tar. A partial tree is
+`E_FETCH_PARTIAL`, never silently accepted.
 
 > **A release run fetches a versioned tree instead.** When Step 0 recorded `CUBESTACK_RELEASE`,
 > `fetch-offline` fetches `<root>/<version>/offline-files/` with the CLI tar beside it.
