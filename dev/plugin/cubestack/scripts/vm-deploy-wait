@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# vm-deploy-wait — follow the detached deploy started by vm-install.
+#
+# The deploy can outlast the foreground tool ceiling, so this is a bounded poll
+# over SSH: the remote wrapper writes /data/install/deploy.rc when the installer
+# exits. A timeout is reported, never extended.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+TIMEOUT=3600
+POLL=20
+
+usage() {
+  cat <<'USAGE'
+vm-deploy-wait [--run ID] [--timeout SECONDS] [--poll SECONDS]
+  --run ID             run id (default: this run's id)
+  --timeout SECONDS    overall budget (default 3600)
+  --poll SECONDS       poll interval (default 20)
+  -h, --help           this text
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)     cs_need_val "$@"; cs_run_opt "${2:-}"; shift 2 ;;
+    --timeout) cs_need_val "$@"; TIMEOUT="${2:-}"; shift 2 ;;
+    --poll)    cs_need_val "$@"; POLL="${2:-}"; shift 2 ;;
+    -h|--help) usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+cs_kv_nonnumeric "$TIMEOUT" && cs_usage_fail "--timeout must be a positive integer"
+cs_kv_nonnumeric "$POLL" && cs_usage_fail "--poll must be a positive integer"
+[ "$TIMEOUT" -gt 0 ] && [ "$POLL" -gt 0 ] || cs_usage_fail "timeout and poll must be > 0"
+
+MASTER_IP="$(cs_run_env_get VM_MASTER_IP)"
+MASTER_USER="$(cs_run_env_get VM_MASTER_USER)"
+SSH_KEY="$(cs_run_env_get VM_SSH_KEY)"
+[ -n "$MASTER_IP" ] && [ -n "$MASTER_USER" ] && [ -n "$SSH_KEY" ] \
+  || cs_usage_fail "run.env has no VM master/key; run vm-install first"
+
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15)
+start=$(date +%s)
+while :; do
+  rc="$(ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" \
+        'cat /data/install/deploy.rc 2>/dev/null || true' 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$rc" ]; then
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$rc" = "0" ]; then
+      cs_ok "rc=0" "elapsed=$elapsed" "master=$MASTER_IP"
+    fi
+    cs_fail E_DEPLOY_FAILED "rc=$rc" "elapsed=$elapsed" \
+      recover=stop-report:user \
+      hint="deploy exited non-zero; inspect /data/install/install.log on $MASTER_IP"
+  fi
+  elapsed=$(( $(date +%s) - start ))
+  if [ "$elapsed" -ge "$TIMEOUT" ]; then
+    cs_fail E_DEPLOY_TIMEOUT "elapsed=$elapsed" "budget=${TIMEOUT}s" \
+      recover=stop-report:user \
+      hint="deploy is still running; inspect /data/install/install.log on $MASTER_IP"
+  fi
+  sleep "$POLL"
+done

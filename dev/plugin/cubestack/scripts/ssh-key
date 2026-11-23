@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# ssh-key — resolve (or generate) the SSH identity used by VM-direct installs.
+#
+# The installer container runs on the target VM, so the VM needs an authorized
+# key before it exists. This script is the single place that decides which key
+# that is; Step 1 hands the public half to the VM provisioning skill and
+# vm-install uses the private half from the workstation.
+#
+# Resolution order:
+#   1. --key FILE
+#   2. $CUBESTACK_SSH_KEY
+#   3. ~/.ssh/id_ed25519, id_rsa, id_ecdsa, id_dsa
+#   4. a run-scoped key under <run-dir>/ssh/id_ed25519
+#
+# It is deliberately read-only for existing keys: the private key is never
+# copied, rewritten, or printed. A missing .pub beside an existing key is
+# derived with `ssh-keygen -y` and written next to it.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+KEY_OPT=""
+PRINT_PUB=0
+
+usage() {
+  cat <<'USAGE'
+ssh-key [options]
+  --key FILE    use this private key (overrides discovery)
+  --run ID      run id used for the fallback key and run dir
+  --print-pub   also print the public key line on stdout
+  -h, --help    this text
+
+Verdict: RESULT: OK key=<private> pub_file=<public> fingerprint=<SHA256:...>
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --key)       cs_need_val "$@"; KEY_OPT="${2:-}"; shift 2 ;;
+    --run)       cs_need_val "$@"; cs_run_opt "${2:-}"; shift 2 ;;
+    --print-pub) PRINT_PUB=1; shift ;;
+    -h|--help)   usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+command -v ssh-keygen >/dev/null 2>&1 \
+  || cs_fail E_INTERNAL recover=stop-report:user hint="ssh-keygen is required on the workstation"
+
+KEY=""
+if [ -n "$KEY_OPT" ]; then
+  KEY="$KEY_OPT"
+elif [ -n "${CUBESTACK_SSH_KEY:-}" ]; then
+  KEY="$CUBESTACK_SSH_KEY"
+else
+  for candidate in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" \
+                   "$HOME/.ssh/id_ecdsa" "$HOME/.ssh/id_dsa"; do
+    [ -f "$candidate" ] && { KEY="$candidate"; break; }
+  done
+fi
+
+if [ -z "$KEY" ]; then
+  KEY="$(cs_run_dir)/ssh/id_ed25519"
+  mkdir -p "$(dirname "$KEY")" && chmod 700 "$(dirname "$KEY")"
+  if [ ! -f "$KEY" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C "cubestack-install $(basename "$(cs_run_dir)")" -f "$KEY" \
+      || cs_fail E_INTERNAL recover=stop-report:user hint="could not generate $KEY"
+    cs_note "generated run-scoped SSH key $KEY"
+  fi
+fi
+
+[ -f "$KEY" ] || cs_fail E_SSH_KEY "key=$KEY" recover=stop-report:user \
+  hint="no SSH private key at $KEY; pass --key with an unencrypted key"
+
+PUB="${KEY}.pub"
+if [ ! -f "$PUB" ]; then
+  if ! ssh-keygen -y -P '' -f "$KEY" >"$PUB" 2>/dev/null; then
+    rm -f "$PUB"
+    cs_fail E_SSH_KEY "key=$KEY" recover=stop-report:user \
+      hint="cannot derive the public key; the key may be encrypted or unreadable (use an unencrypted key or ssh-agent)"
+  fi
+  chmod 644 "$PUB"
+fi
+
+FP="$(ssh-keygen -lf "$PUB" 2>/dev/null | awk '{print $2}')"
+[ -n "$FP" ] || FP="unknown"
+
+if [ "$PRINT_PUB" -eq 1 ]; then
+  cat "$PUB"
+fi
+cs_ok "key=$KEY" "pub_file=$PUB" "fingerprint=$FP"

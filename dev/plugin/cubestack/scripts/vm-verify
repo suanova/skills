@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# vm-verify — read-only health check for a VM-direct install.
+#
+# Runs inside the environment the install created: the cubestack-cli podman
+# container on the master VM. It checks nodes, pods, and (unless --k8s-only)
+# the CubeStackCluster, components, GPU exporter and portal.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+K8S_ONLY=0
+CONTAINER="cubestack-cli"
+
+usage() {
+  cat <<'USAGE'
+vm-verify [--run ID] [--k8s-only] [--container NAME]
+  --run ID          run id (default: this run's id)
+  --k8s-only        verify only the k8s box (no CubeStackCluster/portal)
+  --container NAME  podman container (default cubestack-cli)
+  -h, --help        this text
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)       cs_need_val "$@"; cs_run_opt "${2:-}"; shift 2 ;;
+    --k8s-only)  K8S_ONLY=1; shift ;;
+    --container) cs_need_val "$@"; CONTAINER="${2:-}"; shift 2 ;;
+    -h|--help)   usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+MASTER_IP="$(cs_run_env_get VM_MASTER_IP)"
+MASTER_USER="$(cs_run_env_get VM_MASTER_USER)"
+SSH_KEY="$(cs_run_env_get VM_SSH_KEY)"
+[ -n "$MASTER_IP" ] && [ -n "$MASTER_USER" ] && [ -n "$SSH_KEY" ] \
+  || cs_usage_fail "run.env has no VM master/key; run vm-install first"
+
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15)
+out="$(ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" bash -s -- "$K8S_ONLY" "$CONTAINER" <<'REMOTE' 2>&1
+set -uo pipefail
+K8S_ONLY="$1"; C="$2"
+fail=0
+note() { printf '%-28s %s\n' "$1" "$2"; }
+bad()  { note "$1" "$2"; fail=1; }
+sudo podman ps --format '{{.Names}}' | grep -qx "$C" || { echo "ERROR: container $C is not running"; exit 1; }
+sudo podman exec "$C" mkdir -p /root/.kube
+if ! sudo podman exec "$C" test -f /root/.kube/config; then
+  sudo podman cp /etc/kubernetes/admin.conf "$C:/root/.kube/config" >/dev/null 2>&1 || { echo "ERROR: admin.conf not available"; exit 1; }
+fi
+k() { sudo podman exec "$C" kubectl "$@" 2>/dev/null; }
+
+nodes="$(k get nodes --no-headers 2>/dev/null)"
+not_ready="$(printf '%s\n' "$nodes" | awk '$2 != "Ready"' | wc -l)"
+total="$(printf '%s\n' "$nodes" | grep -c . || true)"
+if [ "${not_ready:-0}" -eq 0 ] && [ "${total:-0}" -gt 0 ]; then note nodes "${total} Ready"; else bad nodes "${not_ready} not Ready of ${total}"; fi
+
+pods="$(k get pods -A --no-headers 2>/dev/null)"
+not_running="$(printf '%s\n' "$pods" | awk '$4 != "Running" && $4 != "Completed"' | wc -l)"
+ptotal="$(printf '%s\n' "$pods" | grep -c . || true)"
+if [ "${not_running:-0}" -eq 0 ]; then note pods "${ptotal} total, all Running/Completed"; else bad pods "${not_running} not Running of ${ptotal}"; printf '%s\n' "$pods" | awk '$4 != "Running" && $4 != "Completed"' | head -5; fi
+
+if [ "$K8S_ONLY" = "0" ]; then
+  cr="$(k -n cubestack-system get cubestackcluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+  if [ -n "$cr" ]; then
+    ready="$(k -n cubestack-system get cubestackcluster "$cr" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
+    phases="$(k -n cubestack-system get cubestackcluster "$cr" -o jsonpath='{range .status.components[*]}{.name}={.phase}{"\n"}{end}' 2>/dev/null)"
+    ct="$(printf '%s\n' "$phases" | grep -c . || true)"
+    cr_ready="$(printf '%s\n' "$phases" | grep -c '=Ready' || true)"
+    [ "$ready" = "True" ] && note cubestackcluster "$cr Ready=True" || bad cubestackcluster "$cr Ready=${ready:-unknown}"
+    if [ "${cr_ready:-0}" -eq "${ct:-0}" ] && [ "${ct:-0}" -gt 0 ]; then note components "${cr_ready}/${ct} Ready"; else bad components "${cr_ready}/${ct} Ready"; fi
+  else
+    bad cubestackcluster "not found in cubestack-system"
+  fi
+  node_ip="$(k get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)"
+  nodeport="$(k -n envoy-gateway-system get svc -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.ports[0].nodePort}{"\n"}{end}' 2>/dev/null | awk '/cubestack-gateway/ && $2 != "" {print $2; exit}')"
+  if [ -n "$nodeport" ] && [ -n "$node_ip" ]; then note portal "http://${node_ip}:${nodeport}/"; else bad portal "gateway NodePort or node IP not found"; fi
+fi
+
+[ "$fail" -eq 0 ] && { echo "RESULT: OK"; exit 0; } || { echo "RESULT: FAIL"; exit 1; }
+REMOTE
+)"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  cs_ok "vms=$(printf '%s\n' "$out" | grep -c 'Ready' || true)" "master=$MASTER_IP"
+fi
+printf '%s\n' "$out" | tail -20 >&2
+cs_fail E_VERIFY "master=$MASTER_IP" recover=stop-report:user \
+  hint="health checks failed; inspect the lines above or /data/install/install.log"
