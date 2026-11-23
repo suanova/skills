@@ -137,40 +137,53 @@ cs_cleanup() {
 }
 
 # --- seed minio.conf --------------------------------------------------------
-# The helper is re-copied unconditionally: a stale copy from an older run must
-# never be able to execute, and the pod's /tmp does not survive a recreate.
-cs_logged kubectl -n "$CS_NS" cp "$SELF_DIR/lib/cubestack-minio-conf.py" \
-  "$CS_NS/$CS_POD:/tmp/cubestack-minio-conf.py" || \
-  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" hint="could not copy the minio helper in"
+has_legacy="$(cs_pod_exec "$CS_POD" bash -c \
+  "test -f $REPO/deployments/scripts/tools/offline/fetch-offline-from-minio.sh && echo 1 || echo 0" \
+  2>/dev/null | tr -d '[:space:]')"
+[ -n "$has_legacy" ] || has_legacy=0
+# 2.1+ release trees are fetched by their own fetch-offline.sh, which reads the
+# values file directly. Only the legacy fetcher (2.0) and the dev channel need
+# deployments/config/minio.conf — newer CLI images no longer ship its example.
+need_minio_conf=1
+[ -n "$REL" ] && [ "$has_legacy" = "0" ] && need_minio_conf=0
+
 cs_logged kubectl -n "$CS_NS" cp "$VALUES" \
   "$CS_NS/$CS_POD:$POD_VALUES" || \
-  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" hint="could not copy the values file in"
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover=rerun:pod-up hint="could not copy the values file in"
 
-# A missing example is the one case where we cannot proceed at all — it means
-# the installer image is not what we expect.
-if ! cs_pod_exec "$CS_POD" bash -c "test -f $CONF_DIR/minio.conf.example" >/dev/null 2>&1; then
-  cs_fail E_FETCH_NO_MINIO_CONF "pod=$CS_POD" recover=stop-report:user \
-    hint="neither minio.conf nor minio.conf.example exists in the pod"
-fi
+if [ "$need_minio_conf" = "1" ]; then
+  # The helper is re-copied unconditionally: a stale copy from an older run must
+  # never be able to execute, and the pod's /tmp does not survive a recreate.
+  cs_logged kubectl -n "$CS_NS" cp "$SELF_DIR/lib/cubestack-minio-conf.py" \
+    "$CS_NS/$CS_POD:/tmp/cubestack-minio-conf.py" || \
+    cs_fail E_POD_EXEC "pod=$CS_POD" recover=rerun:pod-up hint="could not copy the minio helper in"
 
-out="$(cs_pod_exec "$CS_POD" bash -c "
-  set -a; . $POD_VALUES; set +a
-  python3 /tmp/cubestack-minio-conf.py $CONF_DIR/minio.conf $CONF_DIR/minio.conf.example")"
-rc=$?
-case "$rc" in
-  0) ;;
-  11) cs_fail E_CONF_VALUES_MISSING "file=$VALUES" \
-        recover="fix-values:$VALUES:MINIO_EP,MINIO_AK,MINIO_SK" \
-        hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
-  *) cs_fail E_FETCH_NO_MINIO_CONF "rc=$rc" recover=stop-report:user \
-        hint="could not write minio.conf: $(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-100)" ;;
-esac
+  # A missing example is the one case where we cannot proceed at all — it means
+  # the installer image is not what we expect.
+  if ! cs_pod_exec "$CS_POD" bash -c "test -f $CONF_DIR/minio.conf.example" >/dev/null 2>&1; then
+    cs_fail E_FETCH_NO_MINIO_CONF "pod=$CS_POD" recover=stop-report:user \
+      hint="neither minio.conf nor minio.conf.example exists in the pod"
+  fi
 
-# Byte-gate: a redacted secret fails exactly like an absent file.
-if cs_pod_exec "$CS_POD" bash -c "grep -F '***' $CONF_DIR/minio.conf" >/dev/null 2>&1; then
-  cs_fail E_CONF_REDACTED "where=minio.conf" "file=$VALUES" \
-    recover="fix-values:$VALUES:MINIO_SK" \
-    hint="redaction artifacts on disk in minio.conf; a redacted secret fails like an absent file"
+  out="$(cs_pod_exec "$CS_POD" bash -c "
+    set -a; . $POD_VALUES; set +a
+    python3 /tmp/cubestack-minio-conf.py $CONF_DIR/minio.conf $CONF_DIR/minio.conf.example")"
+  rc=$?
+  case "$rc" in
+    0) ;;
+    11) cs_fail E_CONF_VALUES_MISSING "file=$VALUES" \
+          recover="fix-values:$VALUES:MINIO_EP,MINIO_AK,MINIO_SK" \
+          hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
+    *) cs_fail E_FETCH_NO_MINIO_CONF "rc=$rc" recover=stop-report:user \
+          hint="could not write minio.conf: $(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-100)" ;;
+  esac
+
+  # Byte-gate: a redacted secret fails exactly like an absent file.
+  if cs_pod_exec "$CS_POD" bash -c "grep -F '***' $CONF_DIR/minio.conf" >/dev/null 2>&1; then
+    cs_fail E_CONF_REDACTED "where=minio.conf" "file=$VALUES" \
+      recover="fix-values:$VALUES:MINIO_SK" \
+      hint="redaction artifacts on disk in minio.conf; a redacted secret fails like an absent file"
+  fi
 fi
 
 # --- skip if already fetched ------------------------------------------------
@@ -200,11 +213,6 @@ fi
 # image may be newer than the release being installed, so the pod's tool set
 # alone is not a reliable version signal. Fall back to the legacy fetcher only
 # when the prefix has no fetch-offline.sh and the pod still carries that tool.
-has_legacy="$(cs_pod_exec "$CS_POD" bash -c \
-  "test -f $REPO/deployments/scripts/tools/offline/fetch-offline-from-minio.sh && echo 1 || echo 0" \
-  2>/dev/null | tr -d '[:space:]')"
-[ -n "$has_legacy" ] || has_legacy=0
-
 if [ -n "$REL" ]; then
   cs_note "fetching release $REL via the release fetch-offline.sh"
   # Derive the line from the release/snapshot name (2.2.0 -> 2.2,
