@@ -383,9 +383,11 @@ creates the component namespaces
 upstream README documents): the operator's `EnsureNamespace` is a server-side apply that merges
 into an existing namespace, so pre-creating is safe, and it closes the window in which the
 operator renders a Deployment the kubelet cannot yet pull into. The catalog's sixth component
-namespace, `metax-operator`, is deliberately absent: `exporters.metax` is a *patch* of a
-cluster-scoped object and installs no workload, so nothing there pulls an image — and the
-namespace belongs to the vendor MetaX operator (`createNamespace: false`).
+namespace, `metax-operator`, is deliberately absent: in 2.0 `exporters.metax` is a *patch* of a
+cluster-scoped object and installs no workload; in 2.1 `metax-data-exporter` runs there and
+pulls `metax/mx-exporter` from the in-cluster registry. Add the namespace (and a pull Secret)
+only if that registry requires authentication — the namespace belongs to the vendor MetaX
+operator (`createNamespace: false`).
 
 **Two pull policies, because the images are rolling `:latest` and the charts default to
 `IfNotPresent`** — a node that cached one would keep running that build with no signal.

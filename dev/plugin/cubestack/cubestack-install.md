@@ -210,7 +210,8 @@ practice: `preflight` records it as `MINIO_EP` in `run.env`, and Step 3's `env-p
 reads that key. Omit it and `env-probe` fails `E_USAGE` with
 `--minio-ip is required (not set on the command line or in run.env)`.
 
-To install a published release, add `--release <version>` (for example `2.0.0-rc2`);
+To install a published release, add `--release <version>` (for example `2.1.0`,
+or a snapshot name such as `2.1-SNAPSHOT-20261121-78a83fb`);
 `--release-root` is needed only when the tree is not under the installer's default
 `/opt/cubestack-installer/offline-releases`. The one flag then carries through the rest
 of the run: Step 4 writes `CUBESTACK_RELEASE` into `cluster.conf`, Step 5 fetches
@@ -1250,9 +1251,10 @@ so a re-run whose request has gone missing *and* whose run has already deployed 
 
 > **A release run needs the release's own CLI image.** `pod-up` defaults to the rolling
 > `cubestack-installer-cli:latest`, but a release tree pins the matching image in its
-> `release.env` (`CUBESTACK_CLI_IMAGE`). Pass it as `--image <that ref>`: the pod's
-> `fetch-offline-from-minio.sh` is what reads the tree, and only the release's image is
-> guaranteed to know the tree's current layout (the versioned CLI tar).
+> `release.env` (`CUBESTACK_CLI_IMAGE`). Pass it as `--image <that ref>`: the pod's fetch
+> path and module set must match the tree. 2.0 ships
+> `fetch-offline-from-minio.sh`; 2.1+ ships `fetch-offline.sh` with each release
+> prefix and expects that image's modules.
 
 > **Omit `--subnet` once `preflight` has run.** `run.env` already holds it, and passing the
 > wrong value is costly rather than merely wrong. The value is the **label** preflight
@@ -1391,24 +1393,43 @@ deletes the other's; a shared path would have one script `rm` the file the other
 "$S/fetch-offline" --run <run-id> --values <values file>
 ```
 
-Seeds `deployments/config/minio.conf` (which is what the fetch actually reads — *not*
-`cluster.conf`) via a repo helper, byte-gates it, then fetches the offline tree. Idempotent: `du`
-on `offline-files/` is the only evidence a prior fetch completed, so a re-run above the floor
-returns `skipped=1`. A partial tree is `E_FETCH_PARTIAL`, never silently accepted.
+For the dev channel and 2.0 legacy fetches it seeds `deployments/config/minio.conf` (which is
+what those fetchers actually read — *not* `cluster.conf`) via a repo helper and byte-gates it.
+A 2.1+ release tree skips that file entirely: its own `fetch-offline.sh` reads the values file
+directly, and newer CLI images no longer ship `minio.conf.example`. Idempotent: `du` on
+`offline-files/` is the only evidence a dev fetch completed, so a re-run above the floor returns
+`skipped=1`; a release tree is graded on `_SUCCESS`/`release.env`/CLI tar. A partial tree is
+`E_FETCH_PARTIAL`, never silently accepted.
 
 > **A release run fetches a versioned tree instead.** When Step 0 recorded `CUBESTACK_RELEASE`,
-> `fetch-offline` calls `fetch-offline-from-minio.sh --release <version> --dest <root>`, and the
-> tree lands at `<root>/<version>/offline-files/` with the CLI tar beside it
-> (`cubestack-installer-cli-v<version>.tar`; the older unversioned
-> `cubestack-installer-cli.tar` is still accepted). Completeness is `_SUCCESS` plus a
-> `release.env` naming the version plus that tar — the dev `--floor` and the 15 GiB discussion
-> below do **not** apply. A tree that is already complete returns `skipped=1`; an incomplete one
-> is `E_FETCH_PARTIAL`. Both the dev and release paths read the version from `run.env`, so Step 4
-> and Step 5 stay independent and can run in parallel.
+> `fetch-offline` fetches `<root>/<version>/offline-files/` with the CLI tar beside it.
 >
-> The 2.0.0 tree is roughly 118 GiB; run this step as a **background task** — it can outlast the
-> foreground command ceiling. If the pod's fetch lands the tree one level too deep
-> (`offline-files/offline-files/`), this step flattens it before grading.
+> The fetch path depends on what the pod can do, not on the version string:
+>
+> | Version | Tool in the pod | Source |
+> |---|---|---|
+> | **2.0.x** | `deployments/scripts/tools/offline/fetch-offline-from-minio.sh` | legacy `<version>/` / `offline-files/` |
+> | **2.1+** | `fetch-offline.sh` shipped with the release prefix | `release-store/lines/2.1/{releases,snapshots}/<ver>` or `offline-packages/2.1/<ver>` |
+>
+> 2.2+ reuses the 2.1 path with a different line. The script tries the release
+> prefix first and only falls back to the legacy fetcher when the prefix has no
+> `fetch-offline.sh`, so a pod image newer than the target release fails with a
+> clear prefix error rather than silently using the wrong path. A 2.0 run should
+> still use a 2.0 CLI image (`pod-up --image ...`); the default `:latest` tracks
+> the current line. A 2.1 tree is about **162 GiB**; a full package is
+> downloaded to `/tmp` and assembled.
+>
+> Completeness is `_SUCCESS` + a `release.env` naming the version + the CLI tar
+> (`cubestack-installer-cli-v<version>.tar`; the older unversioned
+> `cubestack-installer-cli.tar` is still accepted) — the dev `--floor` and the
+> 15 GiB discussion below do **not** apply. A complete tree returns `skipped=1`;
+> an incomplete one is `E_FETCH_PARTIAL`. Both paths read the version from
+> `run.env`, so Steps 4 and 5 stay independent and can run in parallel.
+>
+> A 2.1 tree can be reference-only or a full package; the script tries
+> `releases/`, then `snapshots/`, then `offline-packages/`. Run this step as a
+> **background task**; if the pod lands the tree one level too deep
+> (`offline-files/offline-files/`), the script flattens it before grading.
 
 **The floor is the operative number, not any GiB figure in this document.** `deploy` refuses to
 launch below **15360 MiB** (`CS_FETCH_FLOOR_MB`); the fetch script carries its own `--floor`
@@ -1446,6 +1467,13 @@ cheap preconditions first (no `***` in `cluster.conf`, offline files above the f
 1-second failure. It refuses to launch if a deploy is already running
 (`E_DEPLOY_ALREADY_RUNNING` → `recover="rerun:deploy-wait"`).
 
+> **A 2.1+ release tree with external Ceph is one default deployment.** The
+> default plan orders `ceph_csi` before `k8s_registry`, so a single `deploy`
+> (no mode flag) installs base, CSI and platform in the right order. Do not use
+> `--with-k8s` for this shape: it is base-only, and as of installer #216 a later
+> `--skip` overwrites its implicit skips, turning the run into a full deployment
+> anyway. 2.0 keeps its original single launch.
+
 > **`kubectl exec` does not return while the detached deploy lives** — measured 2026-10-19,
 > even with `setsid` + `nohup` + full redirection. The script therefore waits only for the
 > pod's `launched pid` line, then releases the local exec client (which does not touch the
@@ -1477,6 +1505,11 @@ That drift is not a failure and produces no code: it is a `cs_note`, and the `OK
 `fresh=1`. So the normal action on any `deploy` recovery verb stays `rerun:deploy` — it detects the
 drift itself and no verdict ever asks you to pass `--fresh` to it. `--fresh` is a manual escape
 hatch for the case the drift check cannot see (same node set, a state you need discarded anyway).
+
+> **2.1+ treats `--fresh` as explicit authorization for `kubeadm reset`.** The
+> auto-drift path sets it too, so pointing an existing cluster at a different VM
+> set will rebuild Kubernetes on the target. That is the intended recovery for
+> this skill, but confirm the target set before invoking `deploy` on a live box.
 
 ## Step 7 — Verify the k8s box, build the cubestack box, clean up
 
@@ -1625,9 +1658,11 @@ What the pair does, in order, and why the order is not negotiable:
   four more components (the controller-manager, cubepilot, the portal and the model bundles),
   and the Secret goes into `lws-system`, `envoy-gateway-system`, `ai-gateway-system`,
   `monitoring` (shared by prometheus, perses and observability) and `cuberouter`. Two catalog
-  namespaces are deliberately absent: `metax-operator`, because
-  `exporters.metax` is a *patch* of a cluster-scoped object and installs no workload, so
-  nothing there pulls an image — and the namespace belongs to the vendor MetaX operator
+  namespaces are deliberately absent: `metax-operator`, because in 2.0
+  `exporters.metax` is a *patch* of a cluster-scoped object and installs no workload, while
+  in 2.1 `metax-data-exporter` runs there and pulls `metax/mx-exporter` from the in-cluster
+  registry. Add the namespace (and a pull Secret) only if that registry requires
+  authentication; the namespace belongs to the vendor MetaX operator
   (`createNamespace: false`). The Secret
   is built from the values file inside the pod (`--from-file`, never the `--docker-password`
   flag, which would put the token in the pod's process list).
