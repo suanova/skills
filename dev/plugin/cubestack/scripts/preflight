@@ -48,6 +48,8 @@ preflight [options]
   --subnet LABEL   force a subnet label instead of auto-selecting
   --expose MODE    metallb (default) | nodeport
   --index N        force the cubestack<N> index
+  --vm-name NAME   exact VM name (single-node) or pool prefix (multi-node:
+                   NAME-0 … NAME-<N-1>); overrides cubestack<N>
   --harbor FQDN    Harbor endpoint (default harbor.isuanova.com)
   --minio-ep URL   MinIO endpoint for the offline fetch
   --external-ceph  mark the run as importing an external Ceph Provider
@@ -124,6 +126,7 @@ SUBNET=""
 # opt-out, and `verify` does not demand MetalLB on a run that asked for it.
 EXPOSE="metallb"
 INDEX=""
+VM_NAME=""
 HARBOR="$CS_HARBOR_DEFAULT"
 MINIO_EP=""
 EXTERNAL_CEPH=0
@@ -152,6 +155,7 @@ while [ $# -gt 0 ]; do
     --subnet) cs_need_val "$@";  SUBNET="${2:-}"; shift 2 ;;
     --expose) cs_need_val "$@";  EXPOSE="${2:-}"; shift 2 ;;
     --index) cs_need_val "$@";   INDEX="${2:-}"; shift 2 ;;
+    --vm-name) cs_need_val "$@"; VM_NAME="${2:-}"; shift 2 ;;
     --harbor) cs_need_val "$@";  HARBOR="${2:-}"; shift 2 ;;
     --minio-ep) cs_need_val "$@"; MINIO_EP="${2:-}"; shift 2 ;;
     --external-ceph) EXTERNAL_CEPH=1; shift ;;
@@ -167,6 +171,13 @@ while [ $# -gt 0 ]; do
     *) cs_usage_fail "unknown argument: $1" ;;
   esac
 done
+
+if [ -n "$VM_NAME" ]; then
+  case "$VM_NAME" in
+    *[!a-z0-9-]*|'') cs_usage_fail "--vm-name must be lowercase RFC1123 (letters, digits, '-')" ;;
+  esac
+  [ -z "$INDEX" ] || cs_usage_fail "--vm-name and --index are mutually exclusive"
+fi
 
 # --- release selection ------------------------------------------------------
 # The installer validates this same shape before it sources release.env, and the
@@ -374,7 +385,7 @@ if [ -z "$INDEX" ]; then
 fi
 
 # --- free index -------------------------------------------------------------
-if [ -z "$INDEX" ]; then
+if [ -z "$INDEX" ] && [ -z "$VM_NAME" ]; then
   USED_MAX="$(kubectl -n "$CS_NS" get vm,virtualmachinepool -o name 2>/dev/null \
               | sed 's|^.*/||' | grep -E '^cubestack[0-9]+$' \
               | sed 's/^cubestack//' | sort -n | tail -1)"
@@ -383,7 +394,20 @@ if [ -z "$INDEX" ]; then
 fi
 
 # --- naming -----------------------------------------------------------------
-if [ "$NODES" -eq 1 ]; then
+if [ -n "$VM_NAME" ]; then
+  if [ "$NODES" -eq 1 ]; then
+    POOL=""
+    VM_NAMES="$VM_NAME"
+  else
+    POOL="$VM_NAME"
+    VM_NAMES=""
+    i=0
+    while [ "$i" -lt "$NODES" ]; do
+      VM_NAMES="${VM_NAMES}${VM_NAMES:+,}${VM_NAME}-${i}"
+      i=$((i + 1))
+    done
+  fi
+elif [ "$NODES" -eq 1 ]; then
   POOL=""
   VM_NAMES="cubestack${INDEX}"
 else
@@ -415,6 +439,8 @@ fi
 # run, and a pin that could be overridden by a stray flag would be no pin at all.
 if [ -n "$RUN_ID" ] && [ -z "${CUBESTACK_RUN:-}" ]; then
   cs_run_opt "$RUN_ID"
+elif [ -z "${CUBESTACK_RUN:-}" ] && [ -n "$VM_NAME" ]; then
+  cs_run_opt "$VM_NAME"
 elif [ -z "${CUBESTACK_RUN:-}" ]; then
   export CUBESTACK_RUN="$HOME/.cubestack/runs/cubestack${INDEX}"
 fi

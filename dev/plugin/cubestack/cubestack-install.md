@@ -191,7 +191,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 5 | SSH password | `ubuntu` |
 | 6 | MinIO endpoint + keys | **built-in** — the Cluster facts row above; never ask |
 | 7 | Service expose mode | **`metallb`** (LoadBalancer) — MetalLB is a **required** component and this is the default. The pool is **not chosen here**: **Step 1b** reserves a contiguous block of addresses from the host's cubestack-ipam (`--count`, default 4: the envoy gateway, grafana and cuberouter always take three, and a registry exposed through `LoadBalancer` takes the fourth — spare when the registry is NodePort or off) and hands that block to the installer, so every address MetalLB can reach is already bound to this box in the ledger. Nothing is patched after the deploy. `--expose nodeport` is an explicit opt-out, and it also releases the `verify` gate |
-| 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>` |
+| 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>`. `preflight --vm-name NAME` overrides it (single node: exact NAME; multi: pool NAME, members NAME-0…) |
 | 9 | External Ceph | **required** — ask for the Provider's exported `external-ceph.env` path (`--external-ceph-env`). Not an optional storage extra: on the minimal profile it is what the registry's PVC binds to (see *Minimal profile*), so a run without it is not this profile |
 | 10 | Model store on the nodes | off unless the user asks for it — then ask for the Provider's CephFS Linux-host mount guide path (`--cephfs-mount-guide`). Independent of #9: a run can import external Ceph without wanting `/models` on the hosts, and a guide alone does not import anything |
 | 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen components** (all but `exporters.bmc`, which needs an admin-created Secret — see Step 7), *or adopts the platform the deploy already installed if it installed one* (see Step 7). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
@@ -1146,10 +1146,12 @@ countdown — worth setting once you have reviewed those parameters yourself.
 > and `VirtualMachinePool`. Never write VM YAML or apply VM/pool objects from this skill.
 
 Hand `suanova-dev-vm` the resolved parameters: single-node → `VirtualMachine` named
-`cubestack<N>`; multi-node → `VirtualMachinePool` named `cubestack<N>` with
-`replicas=<node-count>` (its §8). Same subnet label and `nodeSelector` for every VM, owner
-label set, RWX/Block/`ceph-rbd-kubevirt` disks, cloud-init `passwd` + `ssh_pwauth: true`
-and **no** `ssh_authorized_keys` (the installer injects its own keypair via sshpass).
+the `VMs` value from preflight (default `cubestack<N>`; `--vm-name zj-vm-1` makes it
+exactly that); multi-node → `VirtualMachinePool` named the pool prefix from preflight
+(default `cubestack<N>`, members `-0…`), with `replicas=<node-count>` (its §8). Same subnet
+label and `nodeSelector` for every VM, owner label set, RWX/Block/`ceph-rbd-kubevirt`
+disks, cloud-init `passwd` + `ssh_pwauth: true` and **no** `ssh_authorized_keys` (the
+installer injects its own keypair via sshpass).
 
 > **2.1+ release VM-direct runs add the workstation key.** Resolve it once with
 > `"$S/ssh-key" --run <run-id>` and put the printed `pub_file` into cloud-init
