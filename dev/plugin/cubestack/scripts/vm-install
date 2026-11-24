@@ -22,6 +22,7 @@ SSH_KEY_OPT=""
 EXT_ENV=""
 HARBOR_RO=""
 CR_VALUES=""
+MC_BINARY=""
 FRESH=0
 NO_OPERATOR=0
 SKIP=""
@@ -39,6 +40,8 @@ vm-install --values <file> --release <version> [options]
   --external-ceph-env FILE Provider's external-ceph.env
   --harbor-ro-values FILE  Harbor robot credential for online operator images
   --cr-values FILE         CubeStackCluster values file to copy into the VM
+  --mc-binary FILE         static MinIO client to install when the VM cannot
+                           reach GitHub (the default download source)
   --fresh                  authorize the installer's cluster reset
   --no-operator            install only the k8s box (deploy --with-k8s)
   --skip KEYS              comma-separated module keys to skip
@@ -59,6 +62,7 @@ while [ $# -gt 0 ]; do
     --external-ceph-env) cs_need_val "$@"; EXT_ENV="${2:-}"; shift 2 ;;
     --harbor-ro-values) cs_need_val "$@"; HARBOR_RO="${2:-}"; shift 2 ;;
     --cr-values)       cs_need_val "$@"; CR_VALUES="${2:-}"; shift 2 ;;
+    --mc-binary)       cs_need_val "$@"; MC_BINARY="${2:-}"; shift 2 ;;
     --fresh)           FRESH=1; shift ;;
     --no-operator)     NO_OPERATOR=1; shift ;;
     --skip)            cs_need_val "$@"; SKIP="${2:-}"; shift 2 ;;
@@ -224,6 +228,12 @@ fi
 if [ "$ONLINE" = "true" ]; then
   scp_master "$HARBOR_RO" "/data/install/harbor-ro.conf" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user hint="could not copy the Harbor credential"
 fi
+if [ -n "$MC_BINARY" ]; then
+  [ -f "$MC_BINARY" ] || cs_fail E_CONF_VALUES_MISSING "file=$MC_BINARY" recover=stop-report:user \
+    hint="--mc-binary points at a file that does not exist"
+  scp_master "$MC_BINARY" "/tmp/mc" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user \
+    hint="could not copy mc to the master"
+fi
 
 ssh_master "chmod 600 /data/install/values.conf /data/install/ssh/cubestack_k8s /data/install/external-ceph.env /data/install/harbor-ro.conf 2>/dev/null || true; chmod 755 /data/install/fetch-release-tree.sh; chmod 644 /data/install/cubestack-apply-conf.py" >/dev/null 2>&1 || true
 
@@ -268,16 +278,24 @@ if ! command -v podman >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 \
   fi
 fi
 
-if ! command -v mc >/dev/null 2>&1; then
-  base="https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z"
-  file="mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"
-  tmp="$(mktemp -d)"
-  curl -fsSL "$base/$file" -o "$tmp/$file"
-  curl -fsSL "$base/$file.sha256sum" -o "$tmp/$file.sha256sum"
-  ( cd "$tmp" && awk '{print $1"  mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"}' "$file.sha256sum" | sha256sum -c - >/dev/null )
-  sudo install -m755 "$tmp/$file" /usr/local/bin/mc
-  rm -rf "$tmp"
+if ! command -v mc >/dev/null 2>&1 && [ -f /tmp/mc ]; then
+  sudo install -m755 /tmp/mc /usr/local/bin/mc
+  rm -f /tmp/mc
 fi
+if ! command -v mc >/dev/null 2>&1; then
+  (
+    set -e
+    base="https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z"
+    file="mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"
+    tmp="$(mktemp -d)"
+    curl -fsSL --connect-timeout 10 --max-time 120 "$base/$file" -o "$tmp/$file"
+    curl -fsSL --connect-timeout 10 --max-time 60 "$base/$file.sha256sum" -o "$tmp/$file.sha256sum"
+    ( cd "$tmp" && awk '{print $1"  mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"}' "$file.sha256sum" | sha256sum -c - >/dev/null )
+    sudo install -m755 "$tmp/$file" /usr/local/bin/mc
+    rm -rf "$tmp"
+  ) || { echo "FAIL: could not download mc; pass --mc-binary with a static mc"; exit 1; }
+fi
+command -v mc >/dev/null 2>&1 || { echo "FAIL: mc is required; pass --mc-binary"; exit 1; }
 
 set -a
 # shellcheck disable=SC1091

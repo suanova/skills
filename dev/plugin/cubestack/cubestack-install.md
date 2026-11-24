@@ -1264,7 +1264,8 @@ so a re-run whose request has gone missing *and* whose run has already deployed 
 > ```bash
 > "$S/vm-install" --run <run-id> --values <values file> --release <version> \
 >   [--ssh-key <private key>] [--external-ceph-env <file>] \
->   [--harbor-ro-values <file>] [--cr-values <file>] [--fresh] [--no-operator]
+>   [--harbor-ro-values <file>] [--cr-values <file>] [--mc-binary <mc>] \
+>   [--fresh] [--no-operator]
 > "$S/vm-deploy-wait" --run <run-id> --timeout 3600
 > "$S/vm-verify" --run <run-id>        # add --k8s-only for --no-operator
 > ```
@@ -1274,7 +1275,8 @@ so a re-run whose request has gone missing *and* whose run has already deployed 
 > It does **not** use `cubestack-installer-cli:latest`. A metallb run still needs Step 1b
 > (`reserve-vips`) first: `vm-install` reads `POOL_RANGE` from `run.env`. For a 2.1+ release
 > do **not** run `pod-up` or Steps 3–6; they are the dev/2.0 pod path. `--no-operator`
-> cannot be combined with `--skip` until installer #216 is fixed.
+> cannot be combined with `--skip` until installer #216 is fixed. If the VM cannot reach
+> GitHub, pass `--mc-binary $(command -v mc)` so `vm-install` does not try to download it.
 
 ```bash
 "$S/pod-up" --run <run-id>          # --subnet defaults to run.env SUBNET
