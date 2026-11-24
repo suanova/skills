@@ -107,6 +107,10 @@ if ! out="$(mc cp "$(mc_path "$prefix/fetch-offline.sh")" "$tmp_script" 2>&1)"; 
 fi
 chmod +x "$tmp_script"
 
+# mc can transiently miss a config written moments earlier when commands run
+# back to back; let the alias settle before the child checks it.
+sleep 1
+
 JOBS="${CUBESTACK_FETCH_JOBS:-8}"
 case "$JOBS" in ''|*[!0-9]*) echo "FAIL: CUBESTACK_FETCH_JOBS must be a positive integer"; exit 14 ;; esac
 [ "$JOBS" -ge 1 ] || { echo "FAIL: CUBESTACK_FETCH_JOBS must be >= 1"; exit 14; }
