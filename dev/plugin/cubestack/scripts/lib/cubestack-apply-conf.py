@@ -388,6 +388,15 @@ def main():
             subst(key, env(key))
             applied.append(key)
 
+    # dev-lab is a release-module toggle whose installer default is true. The
+    # key is not always present in the example/defaults pair, so append when
+    # absent instead of failing the rewrite; an explicit false must still land.
+    dev_lab = env("DEV_LAB_ENABLED")
+    if dev_lab:
+        subst("DEV_LAB_ENABLED",
+              "true" if truthy(dev_lab) else "false", append=True)
+        applied.append("DEV_LAB_ENABLED")
+
     # --- operator image source ----------------------------------------------
     # ONLINE_DEPLOY_CUBESTACK_OPERATOR chooses WHERE the cubeStack operator's
     # images come from — never whether an operator is installed. That is

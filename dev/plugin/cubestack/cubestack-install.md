@@ -529,6 +529,16 @@ declare only `k8s_deploy k8s_registry`, and `07_gpu_lws` deliberately does **not
 operator is also the module most likely to stall on a VM; turn it off when there is no MetaX card
 for it to find.
 
+**dev-lab.** On by default in the release module (`36_dev_lab.sh`):
+
+```
+DEV_LAB_ENABLED='true'            # push the dev-lab image tar into the in-cluster registry
+```
+
+Set it to `false` to skip the dev-lab image load. Because the module defaults to true, an
+absent key is **not** the same as “off”; state `false` explicitly when the box should not carry
+dev-lab.
+
 **The registry and its storage backend.** Both on by default:
 
 ```
