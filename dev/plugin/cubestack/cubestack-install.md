@@ -1146,7 +1146,7 @@ countdown — worth setting once you have reviewed those parameters yourself.
 > and `VirtualMachinePool`. Never write VM YAML or apply VM/pool objects from this skill.
 
 Hand `suanova-dev-vm` the resolved parameters: single-node → `VirtualMachine` named
-the `VMs` value from preflight (default `cubestack<N>`; `--vm-name zj-vm-1` makes it
+the `VMs` value from preflight (default `cubestack<N>`; `--vm-name <name>` makes it
 exactly that); multi-node → `VirtualMachinePool` named the pool prefix from preflight
 (default `cubestack<N>`, members `-0…`), with `replicas=<node-count>` (its §8). Same subnet
 label and `nodeSelector` for every VM, owner label set, RWX/Block/`ceph-rbd-kubevirt`
