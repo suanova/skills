@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# vm-install — prepare a 2.1+ release and start it inside the target VM.
+#
+# This is the VM-direct counterpart of pod-up + fetch-offline + configure +
+# deploy. It runs the installer container with podman on the master VM, so the
+# CLI comes from the release tree itself rather than a moving :latest image.
+#
+# It deliberately stops after starting the detached deploy. Use vm-deploy-wait
+# to follow it and vm-verify to check the result.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+VALUES=""
+RUN_OPT=""
+RELEASE=""
+SSH_KEY_OPT=""
+EXT_ENV=""
+HARBOR_RO=""
+CR_VALUES=""
+MC_BINARY=""
+FRESH=0
+NO_OPERATOR=0
+SKIP=""
+DRY_RUN=0
+
+usage() {
+  cat <<'USAGE'
+vm-install --values <file> --release <version> [options]
+
+  --values FILE            values file (same format as the pod path)
+  --release VERSION        release or snapshot name, e.g. 2.1.0
+  --run ID                 run id (default: this run's id)
+  --ssh-key FILE           private key used from the workstation; defaults to
+                           discovery (see scripts/ssh-key)
+  --external-ceph-env FILE Provider's external-ceph.env
+  --harbor-ro-values FILE  Harbor robot credential for online operator images
+  --cr-values FILE         CubeStackCluster values file to copy into the VM
+  --mc-binary FILE         static MinIO client to install when the VM cannot
+                           reach GitHub (the default download source)
+  --fresh                  authorize the installer's cluster reset
+  --no-operator            install only the k8s box (deploy --with-k8s)
+  --skip KEYS              comma-separated module keys to skip
+  --dry-run                resolve and print the plan without touching the VM
+  -h, --help               this text
+
+The master is read from NODES_MASTER in the values file. The workstation key
+must already be authorized on every VM (Step 1 adds it through cloud-init).
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --values)          cs_need_val "$@"; VALUES="${2:-}"; shift 2 ;;
+    --release)         cs_need_val "$@"; RELEASE="${2:-}"; shift 2 ;;
+    --run)             cs_need_val "$@"; cs_run_opt "${2:-}"; shift 2 ;;
+    --ssh-key)         cs_need_val "$@"; SSH_KEY_OPT="${2:-}"; shift 2 ;;
+    --external-ceph-env) cs_need_val "$@"; EXT_ENV="${2:-}"; shift 2 ;;
+    --harbor-ro-values) cs_need_val "$@"; HARBOR_RO="${2:-}"; shift 2 ;;
+    --cr-values)       cs_need_val "$@"; CR_VALUES="${2:-}"; shift 2 ;;
+    --mc-binary)       cs_need_val "$@"; MC_BINARY="${2:-}"; shift 2 ;;
+    --fresh)           FRESH=1; shift ;;
+    --no-operator)     NO_OPERATOR=1; shift ;;
+    --skip)            cs_need_val "$@"; SKIP="${2:-}"; shift 2 ;;
+    --dry-run)         DRY_RUN=1; shift ;;
+    -h|--help)         usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$VALUES" ] || cs_usage_fail "--values is required"
+[ -n "$RELEASE" ] || cs_usage_fail "--release is required (vm-install is for 2.1+ releases)"
+RUN_ID="$(cs_run_id)" || cs_usage_fail "--run is required (pass the run id printed by preflight)"
+if [ "$NO_OPERATOR" -eq 1 ] && [ -n "$SKIP" ]; then
+  cs_usage_fail "--no-operator cannot be combined with --skip: installer #216 makes --skip override --with-k8s"
+fi
+case "$RELEASE" in
+  *[!0-9A-Za-z._-]*) cs_usage_fail "--release contains unsupported characters: $RELEASE" ;;
+  2.0|2.0.*) cs_usage_fail "vm-install is for 2.1+; use the pod path for 2.0" ;;
+esac
+
+cs_values_lint "$VALUES" SSH_PW NODES_MASTER MINIO_EP MINIO_AK MINIO_SK
+[ -n "$EXT_ENV" ] || EXT_ENV="$(cs_run_env_get EXTERNAL_CEPH_ENV_FILE)"
+[ -n "$EXT_ENV" ] && cs_ceph_env_lint "$EXT_ENV"
+[ -n "$HARBOR_RO" ] || HARBOR_RO="$(cs_run_env_get HARBOR_RO_VALUES_FILE)"
+[ -n "$SKIP" ] && case "$SKIP" in *[!0-9A-Za-z_,-]*) cs_usage_fail "--skip has unsupported characters" ;; esac
+
+# Values stay in the environment only; nothing secret is printed below.
+set -a
+# shellcheck disable=SC1090
+. "$VALUES"
+set +a
+[ -n "${NODES_MASTER:-}" ] || cs_usage_fail "NODES_MASTER is empty in $VALUES"
+[ -n "${SSH_PW:-}" ] || cs_usage_fail "SSH_PW is empty in $VALUES"
+if [ "${CEPH_MODE:-}" = "external" ] && [ -z "$EXT_ENV" ]; then
+  cs_fail E_CONF_VALUES_MISSING "ceph_mode=external" recover=stop-report:user \
+    hint="CEPH_MODE=external requires --external-ceph-env (or EXTERNAL_CEPH_ENV_FILE in run.env)"
+fi
+
+MASTER_HOST="$(printf '%s' "$NODES_MASTER" | cut -d, -f2)"
+MASTER_IP="$(printf '%s' "$NODES_MASTER" | cut -d, -f3)"
+MASTER_USER="$(printf '%s' "$NODES_MASTER" | cut -d, -f4)"
+[ -n "$MASTER_IP" ] && [ -n "$MASTER_USER" ] \
+  || cs_usage_fail "NODES_MASTER must look like role,host,ip,user,-"
+
+# --- SSH identity -----------------------------------------------------------
+if [ -n "$SSH_KEY_OPT" ]; then
+  KEY_OUT="$("$SELF_DIR/ssh-key" --run "$RUN_ID" --key "$SSH_KEY_OPT" 2>&1)"
+else
+  KEY_OUT="$("$SELF_DIR/ssh-key" --run "$RUN_ID" 2>&1)"
+fi
+rc=$?
+[ "$rc" -eq 0 ] || { printf '%s\n' "$KEY_OUT" >&2; cs_fail E_SSH_KEY recover=stop-report:user hint="ssh-key failed"; }
+SSH_KEY="$(printf '%s\n' "$KEY_OUT" | sed -n 's/.* key=\([^ ]*\) .*/\1/p' | tail -1)"
+SSH_PUB="$(printf '%s\n' "$KEY_OUT" | sed -n 's/.* pub_file=\([^ ]*\) .*/\1/p' | tail -1)"
+[ -f "$SSH_KEY" ] || cs_fail E_SSH_KEY "key=$SSH_KEY" recover=stop-report:user hint="ssh-key did not return a usable private key"
+[ -n "$SSH_PUB" ] || cs_fail E_SSH_KEY "key=$SSH_KEY" recover=stop-report:user hint="ssh-key did not return a public key path"
+[ -f "$SSH_PUB" ] || cs_fail E_SSH_KEY "pub=$SSH_PUB" recover=stop-report:user hint="the public key file does not exist"
+SSH_KEY="$(cd "$(dirname "$SSH_KEY")" && pwd)/$(basename "$SSH_KEY")"
+KNOWN_HOSTS="$(cs_run_dir)/known_hosts"
+mkdir -p "$(dirname "$KNOWN_HOSTS")"
+[ -f "$KNOWN_HOSTS" ] || : >"$KNOWN_HOSTS"
+chmod 600 "$KNOWN_HOSTS"
+
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=15)
+SCP_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$KNOWN_HOSTS")
+
+ssh_master() { ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" "$@"; }
+scp_master() { scp "${SCP_OPTS[@]}" "$1" "$MASTER_USER@$MASTER_IP:$2"; }
+
+LINE="$(printf '%s' "$RELEASE" | sed -nE 's/^([0-9]+\.[0-9]+).*/\1/p')"
+[ -n "$LINE" ] || cs_usage_fail "cannot derive the product line from release $RELEASE"
+
+MODE=""
+[ "$NO_OPERATOR" -eq 1 ] && MODE="--with-k8s"
+OPERATOR_IMAGES="$(cs_run_env_get OPERATOR_IMAGES)"
+if [ -n "$EXT_ENV" ] && [ ! -f "$EXT_ENV" ]; then
+  cs_fail E_CONF_VALUES_MISSING "file=$EXT_ENV" recover=stop-report:user \
+    hint="the external-ceph.env path was recorded or passed but the file does not exist"
+fi
+if [ -n "$CR_VALUES" ] && [ ! -f "$CR_VALUES" ]; then
+  cs_fail E_CONF_VALUES_MISSING "file=$CR_VALUES" recover=stop-report:user \
+    hint="--cr-values points at a file that does not exist"
+fi
+ONLINE="false"
+if [ "$OPERATOR_IMAGES" = "online" ] || { [ -z "$OPERATOR_IMAGES" ] && [ -n "$HARBOR_RO" ]; }; then
+  [ -n "$HARBOR_RO" ] || cs_fail E_CONF_VALUES_MISSING "operator=online" \
+    recover=rerun:preflight hint="online operator images need --harbor-ro-values (or run preflight with a robot credential)"
+  [ -f "$HARBOR_RO" ] || cs_fail E_CONF_VALUES_MISSING "file=$HARBOR_RO" \
+    recover=stop-report:user hint="the recorded Harbor robot credential no longer exists"
+  ONLINE="true"
+fi
+EXPOSE="$(cs_run_env_get EXPOSE)"; [ -n "$EXPOSE" ] || EXPOSE="metallb"
+POOL="$(cs_run_env_get POOL_RANGE)"
+DNS="$(cs_run_env_get UPSTREAM_DNS_SERVERS)"
+[ -n "${SERVICE_EXPOSE_MODE:-}" ] && EXPOSE="$SERVICE_EXPOSE_MODE"
+[ -n "${METALLB_POOL:-}" ] && POOL="$METALLB_POOL"
+[ -n "${UPSTREAM_DNS_SERVERS:-}" ] && DNS="$UPSTREAM_DNS_SERVERS"
+if [ "$EXPOSE" != "nodeport" ] && [ -z "$POOL" ]; then
+  cs_fail E_VIP_POOL_MISSING "expose=$EXPOSE" recover="rerun:reserve-vips" \
+    hint="Step 1b (reserve-vips) has not run for this run id; a metallb run needs its pool"
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  mode_label="full"; [ "$NO_OPERATOR" -eq 1 ] && mode_label="k8s-only"
+  fresh_label=""; [ "$FRESH" -eq 1 ] && fresh_label=" fresh"
+  cs_note "dry run — nothing will be written"
+  cs_note "  master   $MASTER_HOST@$MASTER_IP ($MASTER_USER)"
+  cs_note "  key      $SSH_KEY"
+  cs_note "  release  $RELEASE (line $LINE)"
+  cs_note "  mode     ${mode_label}${fresh_label}"
+  cs_note "  expose   $EXPOSE${POOL:+ pool=$POOL}"
+  cs_note "  dns      ${DNS:-default}"
+  cs_note "  ceph     ${EXT_ENV:-none}"
+  cs_note "  operator ${ONLINE}"
+  cs_ok "dry_run=1" "master=$MASTER_IP" "release=$RELEASE" "key=$SSH_KEY"
+fi
+
+cs_run_env_put \
+  "VM_MASTER_IP=$(cs_q "$MASTER_IP")" \
+  "VM_MASTER_USER=$(cs_q "$MASTER_USER")" \
+  "VM_SSH_KEY=$(cs_q "$SSH_KEY")" \
+  "VM_RELEASE=$(cs_q "$RELEASE")"
+
+# --- SSH reachability + copy the install inputs -----------------------------
+if ! ssh_master true >/dev/null 2>&1; then
+  cs_fail E_SSH_AUTH "master=$MASTER_IP" "key=$SSH_KEY" recover=stop-report:user \
+    hint="the workstation key is not authorized on the VM; recreate the VM with this public key: $SSH_PUB"
+fi
+
+# Every VM needs the same key: the installer container runs on the master and
+# reaches the workers over SSH. Fail here rather than 10 minutes into the deploy.
+NODE_LINES="$NODES_MASTER"
+[ -n "${NODES_WORKERS:-}" ] && NODE_LINES="$NODE_LINES|$NODES_WORKERS"
+OLDIFS="$IFS"; IFS='|'
+for line in $NODE_LINES; do
+  [ -n "$line" ] || continue
+  nip="$(printf '%s' "$line" | cut -d, -f3)"
+  nuser="$(printf '%s' "$line" | cut -d, -f4)"
+  [ "$nip" = "$MASTER_IP" ] && continue
+  if ! ssh "${SSH_OPTS[@]}" "$nuser@$nip" true >/dev/null 2>&1; then
+    IFS="$OLDIFS"
+    cs_fail E_SSH_AUTH "vm=$nip" "key=$SSH_KEY" recover=stop-report:user \
+      hint="the workstation key is not authorized on $nip; add this public key: $SSH_PUB"
+  fi
+done
+IFS="$OLDIFS"
+
+ssh_master "sudo install -d /data/pkg /data/releases /data/install /data/install/ssh && sudo chown -R '$MASTER_USER' /data/pkg /data/releases /data/install" >/dev/null 2>&1 \
+  || cs_fail E_SSH_AUTH "master=$MASTER_IP" recover=stop-report:user hint="could not create /data on the master"
+
+scp_master "$VALUES" "/data/install/values.conf" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user hint="could not copy the values file"
+scp_master "$SSH_KEY" "/data/install/ssh/cubestack_k8s" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user hint="could not copy the SSH key"
+scp_master "$SELF_DIR/lib/fetch-release-tree.sh" "/data/install/fetch-release-tree.sh" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user hint="could not copy fetch-release-tree.sh"
+scp_master "$SELF_DIR/lib/cubestack-apply-conf.py" "/data/install/cubestack-apply-conf.py" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user hint="could not copy the config rewriter"
+if [ -n "$EXT_ENV" ]; then
+  scp_master "$EXT_ENV" "/data/install/external-ceph.env" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user hint="could not copy external-ceph.env"
+fi
+if [ -n "$CR_VALUES" ]; then
+  scp_master "$CR_VALUES" "/data/install/cr-values.yaml" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user hint="could not copy the CR values"
+fi
+if [ "$ONLINE" = "true" ]; then
+  scp_master "$HARBOR_RO" "/data/install/harbor-ro.conf" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user hint="could not copy the Harbor credential"
+fi
+if [ -n "$MC_BINARY" ]; then
+  [ -f "$MC_BINARY" ] || cs_fail E_CONF_VALUES_MISSING "file=$MC_BINARY" recover=stop-report:user \
+    hint="--mc-binary points at a file that does not exist"
+  scp_master "$MC_BINARY" "/tmp/mc" >/dev/null 2>&1 || cs_fail E_SSH_AUTH recover=stop-report:user \
+    hint="could not copy mc to the master"
+fi
+
+ssh_master "chmod 600 /data/install/values.conf /data/install/ssh/cubestack_k8s /data/install/external-ceph.env /data/install/harbor-ro.conf 2>/dev/null || true; chmod 755 /data/install/fetch-release-tree.sh; chmod 644 /data/install/cubestack-apply-conf.py" >/dev/null 2>&1 || true
+
+# --- tools, fetch, CLI, config, container -----------------------------------
+# ssh joins argv with spaces, so an empty optional value would disappear and
+# shift every later positional. Pass the setup values as shell assignments on
+# stdin; the remote script is the rest of stdin.
+remote_script="$(mktemp)"
+{
+  printf 'REL=%q\n' "$RELEASE"
+  printf 'LINE=%q\n' "$LINE"
+  printf 'MODE=%q\n' "$MODE"
+  printf 'FRESH=%q\n' "$FRESH"
+  printf 'SKIP=%q\n' "$SKIP"
+  printf 'ONLINE=%q\n' "$ONLINE"
+  printf 'EXT=%q\n' "$EXT_ENV"
+  printf 'CR=%q\n' "$CR_VALUES"
+  printf 'VUSER=%q\n' "$MASTER_USER"
+  printf 'EXPOSE=%q\n' "$EXPOSE"
+  printf 'POOL=%q\n' "$POOL"
+  printf 'DNS=%q\n' "$DNS"
+  cat <<'REMOTE'
+set -euo pipefail
+sudo true >/dev/null 2>&1 || { echo "FAIL: sudo is not passwordless for $VUSER"; exit 1; }
+
+# Never re-fetch over a tree a live deploy is reading, and never rm its
+# container. The pod path refuses this same case with E_DEPLOY_ALREADY_RUNNING.
+if sudo podman ps --format '{{.Names}}' 2>/dev/null | grep -qx cubestack-cli; then
+  if sudo podman exec cubestack-cli pgrep -f deploy-cluster.sh >/dev/null 2>&1; then
+    echo "FAIL: a deploy is still running in cubestack-cli; wait for vm-deploy-wait or run vm-down first"
+    exit 12
+  fi
+fi
+
+if ! command -v podman >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 \
+   || ! command -v python3 >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq podman zstd curl ca-certificates python3 >/dev/null
+  else
+    echo "FAIL: podman/zstd/python3 missing and apt-get is unavailable"; exit 1
+  fi
+fi
+
+if ! command -v mc >/dev/null 2>&1 && [ -f /tmp/mc ]; then
+  sudo install -m755 /tmp/mc /usr/local/bin/mc
+  rm -f /tmp/mc
+fi
+if ! command -v mc >/dev/null 2>&1; then
+  (
+    set -e
+    base="https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z"
+    file="mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"
+    tmp="$(mktemp -d)"
+    curl -fsSL --connect-timeout 10 --max-time 120 "$base/$file" -o "$tmp/$file"
+    curl -fsSL --connect-timeout 10 --max-time 60 "$base/$file.sha256sum" -o "$tmp/$file.sha256sum"
+    ( cd "$tmp" && awk '{print $1"  mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"}' "$file.sha256sum" | sha256sum -c - >/dev/null )
+    sudo install -m755 "$tmp/$file" /usr/local/bin/mc
+    rm -rf "$tmp"
+  ) || { echo "FAIL: could not download mc; pass --mc-binary with a static mc"; exit 1; }
+fi
+command -v mc >/dev/null 2>&1 || { echo "FAIL: mc is required; pass --mc-binary"; exit 1; }
+
+set -a
+# shellcheck disable=SC1091
+. /data/install/values.conf
+set +a
+export MC_CONFIG_DIR="/tmp/mc-vm-install"
+mkdir -p "$MC_CONFIG_DIR"
+mc alias set cs-internal "$MINIO_EP" "$MINIO_AK" "$MINIO_SK" >/dev/null
+
+# Fetch the release tree with the tree's own fetch-offline.sh. The helper
+# handles full-package and reference-only prefixes and returns non-zero on
+# failure; do not continue with a partial tree.
+bash /data/install/fetch-release-tree.sh "$REL" /data/releases /data/install/values.conf "$LINE"
+
+tar="$(find "/data/releases/$REL" -maxdepth 1 -name 'cubestack-installer-cli*.tar' | head -1)"
+[ -n "$tar" ] || { echo "FAIL: no cubestack-installer-cli tar in /data/releases/$REL"; exit 1; }
+load_out="$(sudo podman load -i "$tar" 2>&1)"
+image="$(printf '%s\n' "$load_out" | sed -n 's/^Loaded image: //p' | head -1)"
+[ -n "$image" ] || image="$(sudo podman images --format '{{.Repository}}:{{.Tag}}' | grep 'cubestack-installer-cli' | head -1)"
+[ -n "$image" ] || { echo "FAIL: could not resolve the loaded CLI image"; exit 1; }
+printf '%s\n' "$image" > /data/install/cli-image
+
+sudo podman run --rm --entrypoint cat "$image" \
+  /opt/cubestack-installer/deployments/config/cluster.conf.example > /data/install/cluster.conf
+sudo podman run --rm --entrypoint cat "$image" \
+  /opt/cubestack-installer/deployments/config/cluster.defaults.conf > /data/install/cluster.defaults.conf
+[ -s /data/install/cluster.conf ] || { echo "FAIL: image has no cluster.conf.example"; exit 1; }
+[ -s /data/install/cluster.defaults.conf ] || { echo "FAIL: image has no cluster.defaults.conf"; exit 1; }
+chmod 600 /data/install/cluster.conf
+
+set -a
+# shellcheck disable=SC1091
+. /data/install/values.conf
+[ -f /data/install/harbor-ro.conf ] && . /data/install/harbor-ro.conf
+set +a
+# A previous run's Ceph/CR files must not leak into a run that did not ask for
+# them: the container would mount/source them silently.
+[ -z "$EXT" ] && rm -f /data/install/external-ceph.env
+[ -z "$CR" ] && rm -f /data/install/cr-values.yaml
+export SERVICE_EXPOSE_MODE="${SERVICE_EXPOSE_MODE:-$EXPOSE}"
+export METALLB_POOL="${METALLB_POOL:-$POOL}"
+if [ -z "${UPSTREAM_DNS_SERVERS:-}" ] && [ -z "$DNS" ]; then
+  DNS="$(awk '/^nameserver/{print $2}' /etc/resolv.conf \
+    | grep -vE '^(127\.|169\.254\.)' \
+    | while read -r ns; do
+        getent hosts harbor.isuanova.com >/dev/null 2>&1 && { echo "$ns"; break; }
+      done || true)"
+fi
+export UPSTREAM_DNS_SERVERS="${UPSTREAM_DNS_SERVERS:-$DNS}"
+case "$ONLINE" in
+  true) export ONLINE_DEPLOY_CUBESTACK_OPERATOR=true ;;
+  *)    export ONLINE_DEPLOY_CUBESTACK_OPERATOR=false ;;
+esac
+export CUBESTACK_RELEASE="$REL"
+export CUBESTACK_RELEASE_ROOT=/opt/cubestack-installer/offline-releases
+export CS_EXT_CEPH_ENV=0
+[ -n "$EXT" ] && [ -f /data/install/external-ceph.env ] && export CS_EXT_CEPH_ENV=1
+python3 /data/install/cubestack-apply-conf.py /data/install/cluster.conf /data/install/values.conf
+if [ -n "$CR" ]; then
+  python3 - /data/install/cluster.conf /data/install/cr-values.yaml <<'PY'
+import sys
+path, value = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+line = 'CUBESTACK_OPERATOR_CR_VALUES_FILE="%s"\n' % value
+# Append unconditionally: cluster.conf is sourced top-down, so the last
+# assignment wins over an existing/commented example line.
+text += ("\n" if text and not text.endswith("\n") else "") + line
+open(path, "w", encoding="utf-8").write(text)
+PY
+fi
+chmod 600 /data/install/cluster.conf
+
+sudo podman rm -f cubestack-cli >/dev/null 2>&1 || true
+mounts=(-v "/data/releases/$REL:/opt/cubestack-installer/offline-releases/$REL"
+        -v /data/install/cluster.conf:/opt/cubestack-installer/deployments/config/cluster.conf
+        -v /data/install:/data/install
+        -v /data/install/ssh:/root/.ssh)
+[ -f /data/install/external-ceph.env ] && \
+  mounts+=(-v /data/install/external-ceph.env:/opt/cubestack-installer/deployments/config/external-ceph.env)
+sudo podman run -d --name cubestack-cli --network host --entrypoint /bin/bash \
+  "${mounts[@]}" -e SSH_KEY_DIR=/data/install/ssh "$image" -c 'sleep infinity' >/dev/null
+
+# values.conf/harbor-ro.conf were only inputs to the rewriter; the deploy reads
+# cluster.conf and the mounted SSH key. Drop the extra secret copies.
+rm -f /data/install/values.conf /data/install/harbor-ro.conf
+
+rm -f /data/install/deploy.*.rc
+ATTEMPT="$(date +%s)-$$"
+printf '%s\n' "$ATTEMPT" > /data/install/deploy.attempt
+skip_arg=""
+[ -n "$SKIP" ] && skip_arg="--skip $SKIP"
+fresh_arg=""
+[ "$FRESH" = "1" ] && fresh_arg="--fresh"
+cmd="set -a; [ -f /data/install/external-ceph.env ] && . /data/install/external-ceph.env; set +a; cd /opt/cubestack-installer; ./deployments/scripts/deploy-cluster.sh $MODE --release $REL --yes $fresh_arg $skip_arg"
+setsid nohup bash -c "sudo podman exec cubestack-cli bash -lc '$cmd'; echo \$? > /data/install/deploy.$ATTEMPT.rc" \
+  > /data/install/install.log 2>&1 < /dev/null &
+echo "image=$image attempt=$ATTEMPT"
+REMOTE
+} > "$remote_script"
+ssh_master bash -s < "$remote_script"
+rc=$?
+rm -f "$remote_script"
+if [ "$rc" -eq 12 ]; then
+  cs_fail E_DEPLOY_ALREADY_RUNNING "master=$MASTER_IP" recover=stop-report:user \
+    hint="a deploy is still running in cubestack-cli; wait for vm-deploy-wait or run vm-down first"
+fi
+if [ "$rc" -ne 0 ]; then
+  cs_fail E_VM_INSTALL "release=$RELEASE" "master=$MASTER_IP" recover=stop-report:user \
+    hint="vm-install setup failed (see the remote output above)"
+fi
+
+cs_ok "started=1" "release=$RELEASE" "master=$MASTER_IP" "container=cubestack-cli" "log=/data/install/install.log"

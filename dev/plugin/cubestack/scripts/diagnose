@@ -91,6 +91,12 @@ diag_pattern() {
       echo 'fatal:|FAILED|unreachable|TASK \[|PLAY RECAP|ERROR' ;;
     E_DEPLOY_STILL_RUNNING)
       echo 'TASK \[|PLAY \[|RUNNING|changed:' ;;
+    E_VM_INSTALL|E_SSH_KEY)
+      echo 'FAIL:|fetch|podman|apt|mc|ssh|authorized|image|release|key' ;;
+    E_DEPLOY_FAILED|E_DEPLOY_TIMEOUT)
+      echo 'fatal:|FAILED|TASK \[|PLAY RECAP|timeout|deploy' ;;
+    E_VERIFY)
+      echo 'nodes|pods|Ready|component|CR|portal|kubectl' ;;
     E_CEPH_CONNECTING)
       echo 'rook|ceph|Ceph|Connecting|mon|MON|HEALTH' ;;
     E_VERIFY_CEPH_PROFILE)
@@ -166,6 +172,9 @@ diag_pattern() {
 diag_owner() {
   case "$1" in
     E_POD_*)               echo pod-up ;;
+    E_VM_INSTALL|E_SSH_KEY) echo vm-install ;;
+    E_DEPLOY_FAILED|E_DEPLOY_TIMEOUT) echo vm-deploy-wait ;;
+    E_VERIFY)              echo vm-verify ;;
     E_DEPLOY_*)            echo deploy-wait ;;
     E_HARBOR_*|E_MINIO_*)  echo env-probe ;;
     E_CONF_*)              echo configure ;;
@@ -213,7 +222,8 @@ diag_known_code() {
     E_OPERATOR_HARBOR_AUTH|E_OPERATOR_HARBOR_DENIED|E_OPERATOR_HARBOR_LOGIN| \
     E_OPERATOR_CHART_MISSING|E_OPERATOR_APPLY_FAILED|E_OPERATOR_CRD_MISSING| \
     E_OPERATOR_NO_CR|E_OPERATOR_COMPONENT_DEGRADED|E_OPERATOR_IMAGE_PULL| \
-    E_OPERATOR_ROLLOUT|E_OPERATOR_STILL_PROVISIONING)
+    E_OPERATOR_ROLLOUT|E_OPERATOR_STILL_PROVISIONING| \
+    E_VM_INSTALL|E_SSH_KEY|E_DEPLOY_FAILED|E_DEPLOY_TIMEOUT|E_VERIFY|E_VIP_POOL_MISSING)
       return 0 ;;
     E_VIP_NO_POOL|E_VIP_RANGE_EXHAUSTED|E_VIP_RANGE_FRAGMENTED|E_VIP_RANGE_INVALID| \
     E_VIP_RANGE_PENDING|E_VIP_RANGE_DENIED|E_VIP_NO_CRD|E_VIP_COUNT_IMMUTABLE| \
@@ -251,6 +261,11 @@ POD_FIRST=0
 case "$NAME" in
   E_DEPLOY_*|E_VERIFY_*) POD_FIRST=1 ;;
   E_CEPH_*) case "$NAME" in E_CEPH_ENV_*) ;; *) POD_FIRST=1 ;; esac ;;
+esac
+# VM-direct failures have no bootstrap pod; their evidence is on the VM/log
+# named by the verdict hint, not in the pod deploy log.
+case "$NAME" in
+  E_VM_INSTALL|E_SSH_KEY|E_DEPLOY_FAILED|E_DEPLOY_TIMEOUT|E_VERIFY) POD_FIRST=0 ;;
 esac
 
 OUT=""

@@ -1,6 +1,6 @@
 # cubestack-install — k8s box → cubestack box
 
-A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUANOVA cluster: a **k8s box** first, then the platform on top of it. The installer runs inside a bootstrap **pod** and SSHes into the target VMs to run kubespray.
+A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUANOVA cluster: a **k8s box** first, then the platform on top of it. For the dev channel and 2.0 the installer runs inside a bootstrap **pod**; for **2.1+ release runs** it runs directly on the master VM with podman, using the CLI tar from the release tree.
 
 > Core file: `cubestack-install.md` (SKILL.md), driven by the deterministic scripts in
 > `scripts/`. Both must be installed (see [Installation](#installation)).
@@ -31,7 +31,7 @@ A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUAN
 | **Topology** | Single-node (`cubestack<N>`) or multi-node (`VirtualMachinePool` `cubestack<N>` with `replicas` = node count → VMs `cubestack<N>-0/-1/…`) |
 | **Execution** | One script call per step. No subagents — spawning one to make a single call costs more than the call. ~10–12 model round-trips per run |
 | **Failure handling** | Each script emits one machine-readable verdict line with a `recover=` verb from a closed set of six; the model executes the verb rather than diagnosing from prose |
-| **Cleanup** | The bootstrap pod is **ephemeral** — auto-deleted once Step 7 verifies the k8s box |
+| **Cleanup** | Pod mode deletes the bootstrap pod. VM direct mode removes the `cubestack-cli` container with `vm-down`; the VMs remain the sibling skill's responsibility |
 | **Run identity** | A run is scoped to what it installs (`--run cubestack<N>`): its own run dir, stamps, retry counters, **and its own bootstrap pod name**. Two installs can therefore run at the same time without applying to, reusing, or deleting each other's pod |
 | **Storage** | **External Ceph CSI import** (Rook external mode) — consume an existing Ceph outside the cluster for RBD / CephFS. Required by the minimal profile, where it is the in-cluster registry's backend; the Provider exports an `external-ceph.env` and `preflight --external-ceph-env` takes it. Independent of the model store below |
 | **Model store** | Optional **host-level CephFS mount** — the Provider's `/models` mounted read-only at `/models` on every node host, from the Provider's own mount guide. Opt-in, and independent of the CSI import |
@@ -46,7 +46,7 @@ A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUAN
 | **Step 0** | The only user interaction — resolve prerequisites, then one confirmation | `preflight` |
 | **Step 1** | Provision VMs via the sibling `suanova-dev-vm` skill, then confirm by exact name | `vm-ready` |
 | **Step 1b** | *(metallb runs — the default)* Reserve the box's VIP block from the host's cubestack-ipam, **before** the deploy | `reserve-vips` |
-| **Step 2** | Create the installer pod, named for this run *(runs concurrently with Step 1)* | `pod-up` |
+| **Step 2** | Dev/2.0: create the installer pod, named for this run. **2.1+ release:** `vm-install` fetches the tree and starts the installer container with podman on the master VM | `pod-up` / `vm-install` |
 | **Step 3** | Verify the environment from the pod — VM SSH, MinIO, Harbor, `sshpass`, and (online runs) Harbor from each node | `env-probe` |
 | **Step 4** | Generate and byte-verify `cluster.conf` | `configure` |
 | **Step 5** | Fetch the offline package set from MinIO (tens of GiB; the script's own floor decides) | `fetch-offline` |
@@ -54,6 +54,8 @@ A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUAN
 | **Step 7** | Verify the k8s box, *(opt-in: mount the Provider's `/models` on every node)*, *(default on: turn it into a cubestack box — `cubestack-operator` + `CubeStackCluster` CR)*, then rescue the cluster's kubeconfig and auto-delete the installer pod | `verify` + `mount-models` + `operator-up` + `operator-wait` + `pod-down` |
 
 Steps 1 and 2 are independent (the pod only needs the target **subnet label**, not the VMs), so they run concurrently and join at Step 3. `diagnose <CODE>` produces a bounded excerpt when something fails.
+
+**2.1+ release runs** replace Steps 2–6 with `vm-install` (fetch + configure + start), then `vm-deploy-wait` and `vm-verify`. The installer runs from the release's own CLI tar on the master VM; `pod-up` and the pod steps remain the dev/2.0 path.
 
 Three mechanical details worth knowing: `deploy-wait` must run as a **background task** (a deploy outlasts the 600 s foreground ceiling), and completion is **process exit, never the `✅` banner** — the banner is cosmetic and is the first thing lost if a deploy is killed at the end. `operator-wait` is the same shape for the same reason, and unlike `operator-up` it stages nothing into the pod and holds no credential, so re-invoking it is free.
 

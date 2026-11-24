@@ -107,6 +107,10 @@ if ! out="$(mc cp "$(mc_path "$prefix/fetch-offline.sh")" "$tmp_script" 2>&1)"; 
 fi
 chmod +x "$tmp_script"
 
+JOBS="${CUBESTACK_FETCH_JOBS:-8}"
+case "$JOBS" in ''|*[!0-9]*) echo "FAIL: CUBESTACK_FETCH_JOBS must be a positive integer"; exit 14 ;; esac
+[ "$JOBS" -ge 1 ] || { echo "FAIL: CUBESTACK_FETCH_JOBS must be >= 1"; exit 14; }
+
 case "$prefix" in
   */offline-packages/*)
     pkg="/tmp/cubestack-pkg-$rel"
@@ -114,7 +118,7 @@ case "$prefix" in
     if bash "$tmp_script" \
       --source "$prefix" --package-dir "$pkg" \
       --dest "$root/$rel" --all --verify \
-      --mc-alias "$alias_name" --jobs 8; then
+      --mc-alias "$alias_name" --jobs "$JOBS"; then
       rm -f "$tmp_script"
       exit 0
     fi
@@ -130,15 +134,22 @@ case "$prefix" in
     fi
     [ -f "$pkg/fetch-offline.sh" ] || cp "$tmp_script" "$pkg/fetch-offline.sh"
     bash "$pkg/fetch-offline.sh" \
-      --package-dir "$pkg" --dest "$root/$rel" --all --verify
+      --package-dir "$pkg" --dest "$root/$rel" --all --verify --jobs "$JOBS"
     rc=$?
     rm -f "$tmp_script"
     exit "$rc"
     ;;
   *)
+    # Snapshots are already verified per artifact while downloading. The full
+    # SHA256SUMS rehash reads the whole 100G+ tree again; make it opt-in.
+    verify_arg="--verify"
+    case "$prefix" in
+      */snapshots/*) [ "${CUBESTACK_FETCH_FULL_VERIFY:-0}" = "1" ] || verify_arg="" ;;
+    esac
     bash "$tmp_script" \
       --source "$prefix" --store-root "$store" \
-      --mc-alias "$alias_name" --dest "$root/$rel" --verify
+      --mc-alias "$alias_name" --dest "$root/$rel" \
+      --jobs "$JOBS" $verify_arg
     rc=$?
     rm -f "$tmp_script"
     exit "$rc"

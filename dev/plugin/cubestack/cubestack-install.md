@@ -7,7 +7,9 @@ description: Install a CubeStack box on KubeVirt VMs — a k8s box (a single- or
 
 Build a **cubestack box** on KubeVirt VMs: a **k8s box** first, then the platform on top of it.
 The installer runs inside a K8s pod (the bootstrap host) and SSHs into the target VM(s) to run
-kubespray.
+kubespray. **2.1+ release runs use VM direct mode instead:** podman runs the installer inside the
+master VM, using the CLI tar from the release tree rather than the moving `:latest` image. The
+pod path below remains for the dev channel and 2.0.
 
 ## The two boxes
 
@@ -189,7 +191,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 5 | SSH password | `ubuntu` |
 | 6 | MinIO endpoint + keys | **built-in** — the Cluster facts row above; never ask |
 | 7 | Service expose mode | **`metallb`** (LoadBalancer) — MetalLB is a **required** component and this is the default. The pool is **not chosen here**: **Step 1b** reserves a contiguous block of addresses from the host's cubestack-ipam (`--count`, default 4: the envoy gateway, grafana and cuberouter always take three, and a registry exposed through `LoadBalancer` takes the fourth — spare when the registry is NodePort or off) and hands that block to the installer, so every address MetalLB can reach is already bound to this box in the ledger. Nothing is patched after the deploy. `--expose nodeport` is an explicit opt-out, and it also releases the `verify` gate |
-| 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>` |
+| 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>`. `preflight --vm-name NAME` overrides it (single node: exact NAME; multi: pool NAME, members NAME-0…) |
 | 9 | External Ceph | **required** — ask for the Provider's exported `external-ceph.env` path (`--external-ceph-env`). Not an optional storage extra: on the minimal profile it is what the registry's PVC binds to (see *Minimal profile*), so a run without it is not this profile |
 | 10 | Model store on the nodes | off unless the user asks for it — then ask for the Provider's CephFS Linux-host mount guide path (`--cephfs-mount-guide`). Independent of #9: a run can import external Ceph without wanting `/models` on the hosts, and a guide alone does not import anything |
 | 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen components** (all but `exporters.bmc`, which needs an admin-created Secret — see Step 7), *or adopts the platform the deploy already installed if it installed one* (see Step 7). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
@@ -526,6 +528,16 @@ declare only `k8s_deploy k8s_registry`, and `07_gpu_lws` deliberately does **not
 `06_gpu_operator` — so turning these off removes modules rather than orphaning them. The GPU
 operator is also the module most likely to stall on a VM; turn it off when there is no MetaX card
 for it to find.
+
+**dev-lab.** On by default in the release module (`36_dev_lab.sh`):
+
+```
+DEV_LAB_ENABLED='true'            # push the dev-lab image tar into the in-cluster registry
+```
+
+Set it to `false` to skip the dev-lab image load. Because the module defaults to true, an
+absent key is **not** the same as “off”; state `false` explicitly when the box should not carry
+dev-lab.
 
 **The registry and its storage backend.** Both on by default:
 
@@ -1144,10 +1156,23 @@ countdown — worth setting once you have reviewed those parameters yourself.
 > and `VirtualMachinePool`. Never write VM YAML or apply VM/pool objects from this skill.
 
 Hand `suanova-dev-vm` the resolved parameters: single-node → `VirtualMachine` named
-`cubestack<N>`; multi-node → `VirtualMachinePool` named `cubestack<N>` with
-`replicas=<node-count>` (its §8). Same subnet label and `nodeSelector` for every VM, owner
-label set, RWX/Block/`ceph-rbd-kubevirt` disks, cloud-init `passwd` + `ssh_pwauth: true`
-and **no** `ssh_authorized_keys` (the installer injects its own keypair via sshpass).
+the `VMs` value from preflight (default `cubestack<N>`; `--vm-name <name>` makes it
+exactly that); multi-node → `VirtualMachinePool` named the pool prefix from preflight
+(default `cubestack<N>`, members `-0…`), with `replicas=<node-count>` (its §8). Same subnet
+label and `nodeSelector` for every VM, owner label set, RWX/Block/`ceph-rbd-kubevirt`
+disks, cloud-init `passwd` + `ssh_pwauth: true` and **no** `ssh_authorized_keys` (the
+installer injects its own keypair via sshpass).
+
+> **2.1+ release VM-direct runs add the workstation key.** Resolve it once with
+> `"$S/ssh-key" --run <run-id>` and put the printed `pub_file` into cloud-init
+> `ssh_authorized_keys`. `vm-install` uses that private key from the workstation;
+> password-only VMs cannot be reached in direct mode. The installer's own key
+> injection still happens during the deploy. If your key is not at one of the
+> standard `~/.ssh/id_*` paths, pass `--key <private key>` to `ssh-key` and
+> `--ssh-key <private key>` to `vm-install` (the key may have any filename).
+> The first connection uses `accept-new` and pins the host key in the run dir;
+> for strict verification, pre-seed that `known_hosts` from the VM provisioning
+> path before running `vm-install`.
 
 > **Do not hand it a network name.** Every VM gets its underlay address from a cubestack-ipam
 > pool claim and its own minted NAD (`default/<vm-name>-static`); for the pool case the
@@ -1243,7 +1268,27 @@ so a re-run whose request has gone missing *and* whose run has already deployed 
 > The normal lifecycle is the ownerRef: delete the master VM and the request goes with it. `--release`
 > is for a box torn down *without* its VM being deleted.
 
-## Step 2 — Create the installer pod
+## Step 2 — Create the installer host
+
+> **2.1+ release runs use VM direct mode.** Skip Steps 2–6 (pod-up, env-probe, configure,
+> fetch-offline, deploy) and run:
+>
+> ```bash
+> "$S/vm-install" --run <run-id> --values <values file> --release <version> \
+>   [--ssh-key <private key>] [--external-ceph-env <file>] \
+>   [--harbor-ro-values <file>] [--cr-values <file>] [--mc-binary <mc>] \
+>   [--fresh] [--no-operator]
+> "$S/vm-deploy-wait" --run <run-id> --timeout 3600
+> "$S/vm-verify" --run <run-id>        # add --k8s-only for --no-operator
+> ```
+>
+> `vm-install` fetches the release tree, loads `cubestack-installer-cli*.tar` from it,
+> writes `cluster.conf`, and starts the installer container with podman on the master VM.
+> It does **not** use `cubestack-installer-cli:latest`. A metallb run still needs Step 1b
+> (`reserve-vips`) first: `vm-install` reads `POOL_RANGE` from `run.env`. For a 2.1+ release
+> do **not** run `pod-up` or Steps 3–6; they are the dev/2.0 pod path. `--no-operator`
+> cannot be combined with `--skip` until installer #216 is fixed. If the VM cannot reach
+> GitHub, pass `--mc-binary $(command -v mc)` so `vm-install` does not try to download it.
 
 ```bash
 "$S/pod-up" --run <run-id>          # --subnet defaults to run.env SUBNET
@@ -1389,6 +1434,12 @@ deletes the other's; a shared path would have one script `rm` the file the other
 
 ## Step 5 — Fetch the offline packages
 
+> **Snapshot fetch is parallel and skips the full-tree rehash.** `CUBESTACK_FETCH_JOBS`
+> controls parallel downloads (default 8). Every artifact's digest/size is still checked as
+> it downloads; for `snapshots/` prefixes the extra `sha256sum -c` over the whole tree is
+> off unless `CUBESTACK_FETCH_FULL_VERIFY=1`. Release and full-package prefixes keep the
+> full verification.
+
 ```bash
 "$S/fetch-offline" --run <run-id> --values <values file>
 ```
@@ -1512,6 +1563,13 @@ hatch for the case the drift check cannot see (same node set, a state you need d
 > this skill, but confirm the target set before invoking `deploy` on a live box.
 
 ## Step 7 — Verify the k8s box, build the cubestack box, clean up
+
+> **VM direct mode:** `vm-install`'s default full deploy already installs the operator and
+> applies the CR. Use `vm-verify` (not `verify` / `operator-up` / `operator-wait`) and
+> `vm-down` (not `pod-down`). With `--no-operator`, run `vm-verify --k8s-only`; the run ends
+> with the k8s box. The Provider's `/models` mount is handled by the installer's
+> `cephfs_mount` module when the values enable it; `mount-models` is pod-only. `vm-verify`
+> waits 30 s before its first check to let the cluster settle (`--settle 0` skips it).
 
 ```bash
 "$S/verify" --run <run-id> --expect-nodes 3   # external-Ceph checks turn on by themselves for an importing run

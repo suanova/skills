@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# vm-down — stop the VM-direct installer container.
+#
+# The VMs themselves belong to the sibling KubeVirt skill; this only removes the
+# podman container (and optionally the staged data) on the master.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+REMOVE_DATA=0
+CONTAINER="cubestack-cli"
+
+usage() {
+  cat <<'USAGE'
+vm-down [--run ID] [--remove-data] [--container NAME]
+  --run ID          run id (default: this run's id)
+  --remove-data     also remove /data/install and /data/releases on the master
+  --container NAME  podman container (default cubestack-cli)
+  -h, --help        this text
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)         cs_need_val "$@"; cs_run_opt "${2:-}"; shift 2 ;;
+    --remove-data) REMOVE_DATA=1; shift ;;
+    --container)   cs_need_val "$@"; CONTAINER="${2:-}"; shift 2 ;;
+    -h|--help)     usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+MASTER_IP="$(cs_run_env_get VM_MASTER_IP)"
+MASTER_USER="$(cs_run_env_get VM_MASTER_USER)"
+SSH_KEY="$(cs_run_env_get VM_SSH_KEY)"
+[ -n "$MASTER_IP" ] && [ -n "$MASTER_USER" ] && [ -n "$SSH_KEY" ] \
+  || cs_usage_fail "run.env has no VM master/key; run vm-install first"
+case "$CONTAINER" in ''|*[!A-Za-z0-9._-]*) cs_usage_fail "--container has unsupported characters" ;; esac
+
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$(cs_run_dir)/known_hosts"
+          -o ConnectTimeout=15)
+remote="if sudo podman ps -a --format '{{.Names}}' | grep -qx '$CONTAINER'; then sudo podman rm -f '$CONTAINER' || exit 1; fi"
+[ "$REMOVE_DATA" -eq 1 ] && remote="$remote; sudo rm -rf /data/install /data/releases /data/pkg"
+if ! ssh "${SSH_OPTS[@]}" "$MASTER_USER@$MASTER_IP" "$remote" >/dev/null 2>&1; then
+  cs_fail E_SSH_AUTH "master=$MASTER_IP" recover=stop-report:user hint="could not reach the master VM"
+fi
+cs_ok "container=$CONTAINER" "removed=$REMOVE_DATA" "master=$MASTER_IP"
