@@ -1424,6 +1424,12 @@ deletes the other's; a shared path would have one script `rm` the file the other
 
 ## Step 5 — Fetch the offline packages
 
+> **Snapshot fetch is parallel and skips the full-tree rehash.** `CUBESTACK_FETCH_JOBS`
+> controls parallel downloads (default 8). Every artifact's digest/size is still checked as
+> it downloads; for `snapshots/` prefixes the extra `sha256sum -c` over the whole tree is
+> off unless `CUBESTACK_FETCH_FULL_VERIFY=1`. Release and full-package prefixes keep the
+> full verification.
+
 ```bash
 "$S/fetch-offline" --run <run-id> --values <values file>
 ```
