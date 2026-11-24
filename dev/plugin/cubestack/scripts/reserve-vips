@@ -94,7 +94,7 @@ cs_init
 # at Step 4 and this script runs at Step 1b, so the count cannot be derived from
 # the run's own record here — it has to be passed in.
 #
-# It is FIRST-INVOCATION-ONLY, because `spec.count` is immutable: the API server
+# It is FIRST-INVOCATION-ONLY, because `spec.allocation.count` is immutable: the API server
 # refuses a change, so a re-run that asked for a different size would die on a
 # confusing patch error. Instead the live object always wins, a re-run with no
 # --count reuses silently, and an explicit --count that disagrees fails loudly
@@ -201,7 +201,7 @@ if [ -n "$IPAM_POOL" ]; then
 fi
 
 # A count that is not a positive integer would not fail here — it would fail as
-# a shell arithmetic error later, or as the API server rejecting spec.count with
+# a shell arithmetic error later, or as the API server rejecting spec.allocation.count with
 # a message about a JSON type. HARD_CAP is the same bound the create applies, so
 # a --count past it is a count this step will not make rather than a bigger
 # reservation.
@@ -292,7 +292,7 @@ release_range() {  # $1 = name (default: this run's)
 read_range() {
   local out
   out="$(hget -n "$CS_NS" get iprangerequest.ipam.cubestack.io "$RANGE_NAME" \
-    -o jsonpath='{.status.phase}|{.status.start}|{.status.end}|{.status.conditions[?(@.type=="Ready")].reason}|{.spec.count}|{.spec.poolRef}' 2>/dev/null)" || return 1
+    -o jsonpath='{.status.phase}|{.status.start}|{.status.end}|{.status.conditions[?(@.type=="Ready")].reason}|{.spec.allocation.count}|{.spec.poolRef}' 2>/dev/null)" || return 1
   [ -n "$out" ] || return 1
   R_PHASE="${out%%|*}";  out="${out#*|}"
   R_START="${out%%|*}";  out="${out#*|}"
@@ -416,7 +416,7 @@ DEPLOYED=0
 DISPLAY_COUNT="${COUNT:-${REC_RANGE_COUNT:-4}}"
 
 # --- count immutability, the local half --------------------------------------
-# spec.count cannot be changed, so a --count that disagrees with the recorded one
+# spec.allocation.count cannot be changed, so a --count that disagrees with the recorded one
 # is a failure whatever the host says. Checking it here means the common mistake
 # costs no attempt and no host call — and the message is ours rather than the API
 # server's.
@@ -424,11 +424,11 @@ if [ "$COUNT_GIVEN" -eq 1 ] && [ -n "$REC_RANGE_COUNT" ] && [ "$COUNT" != "$REC_
   if [ "$DEPLOYED" -eq 1 ]; then
     cs_fail E_VIP_COUNT_IMMUTABLE "claim=$CS_NS/$RANGE_NAME" "count=$COUNT" "recorded=$REC_RANGE_COUNT" \
       recover=stop-report:user \
-      hint="spec.count is immutable and this block is ${REC_RANGE_COUNT}, not ${COUNT}; this run has already deployed, so its range is baked into cluster.conf and cannot change at all — re-run without --count to reuse it"
+      hint="spec.allocation.count is immutable and this block is ${REC_RANGE_COUNT}, not ${COUNT}; this run has already deployed, so its range is baked into cluster.conf and cannot change at all — re-run without --count to reuse it"
   fi
   cs_fail E_VIP_COUNT_IMMUTABLE "claim=$CS_NS/$RANGE_NAME" "count=$COUNT" "recorded=$REC_RANGE_COUNT" \
     recover=stop-report:user \
-    hint="spec.count is immutable and this block is ${REC_RANGE_COUNT}, not ${COUNT}; re-run without --count to reuse it, or --release and re-run with --count ${COUNT} to draw a fresh block — the redrawn range may differ"
+    hint="spec.allocation.count is immutable and this block is ${REC_RANGE_COUNT}, not ${COUNT}; re-run without --count to reuse it, or --release and re-run with --count ${COUNT} to draw a fresh block — the redrawn range may differ"
 fi
 
 # --- dry run -----------------------------------------------------------------
@@ -625,11 +625,11 @@ if range_exists; then
     if [ "$DEPLOYED" -eq 1 ]; then
       cs_fail E_VIP_COUNT_IMMUTABLE "claim=$CS_NS/$RANGE_NAME" "count=$COUNT" "live=$R_COUNT" \
         recover=stop-report:user \
-        hint="spec.count is immutable and the live request is $R_COUNT addresses, not $COUNT; this run has already deployed, so its range cannot change at all — re-run without --count"
+        hint="spec.allocation.count is immutable and the live request is $R_COUNT addresses, not $COUNT; this run has already deployed, so its range cannot change at all — re-run without --count"
     fi
     cs_fail E_VIP_COUNT_IMMUTABLE "claim=$CS_NS/$RANGE_NAME" "count=$COUNT" "live=$R_COUNT" \
       recover=stop-report:user \
-      hint="spec.count is immutable and the live request is $R_COUNT addresses, not $COUNT; re-run without --count, or --release and re-run with --count $COUNT to draw a fresh block"
+      hint="spec.allocation.count is immutable and the live request is $R_COUNT addresses, not $COUNT; re-run without --count, or --release and re-run with --count $COUNT to draw a fresh block"
   fi
 
   # Read back before anything else so the pool name comes from the object rather
@@ -749,7 +749,9 @@ metadata:
     controller: false
 spec:
   poolRef: $IPAM_POOL
-  count: $COUNT"
+  allocation:
+    strategy: Auto
+    count: $COUNT"
 
 OUT="$(printf '%s' "$YAML" | hget apply -f - 2>&1)"
 case "$OUT" in
